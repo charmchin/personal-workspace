@@ -20,6 +20,9 @@ export interface SecurityStatus {
   databasePath: string;
   keychainMode: "userPresence" | "loginKeychain" | "passphrase";
   snapshotWarning?: string | null;
+  recoveryNotice?: string | null;
+  sessionEpoch: number;
+  lockReason?: string | null;
 }
 
 export interface AppSettings {

@@ -3,7 +3,10 @@ mod commands;
 mod database;
 mod error;
 mod models;
+mod native_lock;
 mod repository;
+mod restore;
+mod session;
 
 use tauri::Manager;
 
@@ -18,6 +21,10 @@ pub fn run() {
             let state = database::AppState::new(data_dir)
                 .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
             app.manage(state);
+            native_lock::install(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(std::sync::Mutex::new(Some(native_lock::start_monitor(
+                app.handle(),
+            ))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -27,6 +34,7 @@ pub fn run() {
             commands::security_unlock_with_password,
             commands::security_change_password,
             commands::security_lock,
+            commands::security_activity,
             commands::get_dashboard,
             commands::list_tasks,
             commands::upsert_task,
@@ -76,6 +84,25 @@ pub fn run() {
             commands::delete_backup,
             commands::restore_snapshot,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                native_lock::remove();
+                let state = app.state::<database::AppState>();
+                state.session.revoke("shutdown");
+                state
+                    .stopping
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let monitor = app.state::<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>();
+                if let Some(thread) = monitor
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                {
+                    thread.thread().unpark();
+                    let _ = thread.join();
+                }
+            }
+        });
 }

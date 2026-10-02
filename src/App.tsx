@@ -6,6 +6,8 @@ import { call, WorkbenchError } from "./lib/api";
 import { defaultSettings } from "./lib/defaults";
 import { localDate } from "./lib/format";
 import { LOCAL_PASSWORD_MIN_LENGTH, passwordCharacterCount } from "./lib/security";
+import { acceptsSecurityStatus, lockMessage, useSecurityBridge } from "./lib/securityBridge";
+import type { LockEvent } from "./lib/securityBridge";
 import { Button, ErrorBanner, Field, Input, LoadingBlock } from "./components/ui";
 import { Shell } from "./components/Shell";
 import { CommandPalette } from "./components/CommandPalette";
@@ -34,10 +36,46 @@ function App() {
   const [error, setError] = useState<WorkbenchError | null>(null);
   const [lockNotice, setLockNotice] = useState<string | null>(null);
   const quoteChecked = useRef(false);
+  const securityEpoch = useRef(0);
+  const statusRef = useRef<SecurityStatus | null>(null);
+
+  const clearSessionUi = useCallback(() => {
+    setQuickOpen(false);
+    setCommandOpen(false);
+    setPasswordOpen(false);
+    setLocalPassword("");
+    setLocalPasswordConfirm("");
+    setError(null);
+    setPage("today");
+  }, []);
+
+  const receiveStatus = useCallback((next: SecurityStatus) => {
+    if (!acceptsSecurityStatus(securityEpoch.current, next, statusRef.current?.unlocked === false)) return;
+    const changed = next.sessionEpoch !== securityEpoch.current || statusRef.current?.unlocked !== next.unlocked;
+    securityEpoch.current = next.sessionEpoch;
+    statusRef.current = next;
+    setStatus(next);
+    if (changed && !next.unlocked) clearSessionUi();
+    if (changed) setLockNotice(lockMessage(next.lockReason));
+  }, [clearSessionUi]);
+
+  const receiveLock = useCallback((event: LockEvent) => {
+    if (event.sessionEpoch < securityEpoch.current) return;
+    const changed = event.sessionEpoch !== securityEpoch.current || statusRef.current?.unlocked;
+    securityEpoch.current = event.sessionEpoch;
+    if (statusRef.current) {
+      const next = { ...statusRef.current, ...event };
+      statusRef.current = next;
+      setStatus(next);
+    }
+    if (changed) { clearSessionUi(); setLockNotice(lockMessage(event.lockReason)); }
+  }, [clearSessionUi]);
+
+  const receiveSecurityError = useCallback((value: WorkbenchError) => setError(value), []);
 
   useEffect(() => {
-    call<SecurityStatus>("security_status").then(setStatus).catch((value) => setError(value as WorkbenchError));
-  }, []);
+    call<SecurityStatus>("security_status").then(receiveStatus).catch((value) => setError(value as WorkbenchError));
+  }, [receiveStatus]);
 
   const loadSettings = useCallback(async () => {
     const value = await call<AppSettings>("get_settings");
@@ -55,8 +93,8 @@ function App() {
     setError(null);
     try {
       const next = await call<SecurityStatus>("security_unlock");
-      setStatus(next);
-      setLockNotice(null);
+      receiveStatus(next);
+      if (!statusRef.current?.unlocked || statusRef.current.sessionEpoch !== next.sessionEpoch) return;
       await loadSettings();
     } catch (value) {
       const nextError = value as WorkbenchError;
@@ -80,8 +118,8 @@ function App() {
     try {
       const command = passwordSetup ? "security_initialize_with_password" : "security_unlock_with_password";
       const next = await call<SecurityStatus>(command, { password: localPassword });
-      setStatus(next);
-      setLockNotice(null);
+      receiveStatus(next);
+      if (!statusRef.current?.unlocked || statusRef.current.sessionEpoch !== next.sessionEpoch) return;
       setPasswordOpen(false);
       setLocalPassword("");
       setLocalPasswordConfirm("");
@@ -94,16 +132,26 @@ function App() {
   }
 
   const lock = useCallback(async (notice?: string) => {
+    // Hide sensitive UI immediately, even when the backend is finishing a database operation.
+    if (statusRef.current) {
+      const next = { ...statusRef.current, unlocked: false };
+      statusRef.current = next;
+      setStatus(next);
+    }
+    clearSessionUi();
+    setLockNotice(notice ?? null);
     try {
       const next = await call<SecurityStatus>("security_lock");
-      setStatus(next);
+      receiveStatus(next);
       setLockNotice(notice ?? null);
-      setQuickOpen(false);
-      setCommandOpen(false);
     } catch (value) {
       setError(value as WorkbenchError);
     }
-  }, []);
+  }, [clearSessionUi, receiveStatus]);
+
+  const hiddenLock = useCallback(() => { void lock("窗口已隐藏，工作台已锁定。"); }, [lock]);
+  useSecurityBridge({ unlocked: status?.unlocked ?? false, onStatus: receiveStatus,
+    onLocked: receiveLock, onFailure: receiveSecurityError, onHidden: hiddenLock });
 
   useEffect(() => {
     const root = document.documentElement;
@@ -132,35 +180,6 @@ function App() {
       document.removeEventListener("workbench:quick-add", quickHandler);
     };
   }, [status?.unlocked]);
-
-  useEffect(() => {
-    if (!status?.unlocked) return;
-    let timer: number | undefined;
-    let hiddenTimer: number | undefined;
-    const reset = () => {
-      if (timer) window.clearTimeout(timer);
-      if (settings.lockMinutes > 0) {
-        timer = window.setTimeout(() => void lock(), settings.lockMinutes * 60_000);
-      }
-    };
-    const visibility = () => {
-      if (document.hidden) hiddenTimer = window.setTimeout(() => void lock(), 1_000);
-      else {
-        if (hiddenTimer) window.clearTimeout(hiddenTimer);
-        reset();
-      }
-    };
-    reset();
-    const events: Array<keyof WindowEventMap> = ["pointerdown", "keydown", "wheel", "touchstart"];
-    events.forEach((event) => window.addEventListener(event, reset, { passive: true }));
-    document.addEventListener("visibilitychange", visibility);
-    return () => {
-      if (timer) window.clearTimeout(timer);
-      if (hiddenTimer) window.clearTimeout(hiddenTimer);
-      events.forEach((event) => window.removeEventListener(event, reset));
-      document.removeEventListener("visibilitychange", visibility);
-    };
-  }, [lock, settings.lockMinutes, status?.unlocked]);
 
   useEffect(() => {
     if (!status?.unlocked || !settings.quoteEnabled || !settings.quoteAutoRefresh || quoteChecked.current) return;
@@ -208,7 +227,11 @@ function App() {
   else content = <SettingsPage settings={settings} onSettingsChange={setSettings} onLock={(notice) => void lock(notice)} />;
 
   return <>
-    <Shell page={page} setPage={setPage} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} onOpenCommand={() => setCommandOpen(true)} onQuickAdd={() => { setPage("today"); setQuickOpen(true); }} onLock={() => void lock()}>{status.snapshotWarning && <div className="notice-banner global-warning" role="status"><DatabaseZap size={17} /><span>{status.snapshotWarning}。请检查本机空间和数据目录权限，然后重新打开工作台。</span><button aria-label="关闭提示" onClick={() => setStatus((current) => current ? { ...current, snapshotWarning: null } : current)}>×</button></div>}<Suspense fallback={<div className="page"><LoadingBlock rows={6} /></div>}>{content}</Suspense></Shell>
+    <Shell page={page} setPage={setPage} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} onOpenCommand={() => setCommandOpen(true)} onQuickAdd={() => { setPage("today"); setQuickOpen(true); }} onLock={() => void lock()}>
+      {status.recoveryNotice && <div className="notice-banner global-warning" role="status"><ShieldCheck size={17} /><span>{status.recoveryNotice}</span><button aria-label="关闭恢复提示" onClick={() => setStatus((current) => current ? { ...current, recoveryNotice: null } : current)}>×</button></div>}
+      {status.snapshotWarning && <div className="notice-banner global-warning" role="status"><DatabaseZap size={17} /><span>{status.snapshotWarning}。请检查本机空间和数据目录权限，然后重新打开工作台。</span><button aria-label="关闭提示" onClick={() => setStatus((current) => current ? { ...current, snapshotWarning: null } : current)}>×</button></div>}
+      <Suspense fallback={<div className="page"><LoadingBlock rows={6} /></div>}>{content}</Suspense>
+    </Shell>
     <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} navigate={setPage} quickAdd={() => { setPage("today"); setQuickOpen(true); }} />
   </>;
 }

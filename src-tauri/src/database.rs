@@ -4,12 +4,13 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
+    sync::atomic::AtomicBool,
 };
 
 use age::{Decryptor, Encryptor, Identity, secrecy::SecretString};
 use chrono::{Datelike, Local, SecondsFormat, Utc};
 use rand::RngCore;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use security_framework::{
     access_control::{ProtectionMode, SecAccessControl},
     passwords::{
@@ -37,6 +38,7 @@ pub struct RuntimeState {
     pub connection: Option<Connection>,
     pub key: Option<Zeroizing<Vec<u8>>>,
     pub snapshot_warning: Option<String>,
+    pub recovery_notice: Option<String>,
 }
 
 pub struct AppState {
@@ -44,6 +46,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub database_path: PathBuf,
     pub backup_dir: PathBuf,
+    pub(crate) session: crate::session::SessionPolicy,
+    pub(crate) stopping: AtomicBool,
 }
 
 impl AppState {
@@ -69,26 +73,48 @@ impl AppState {
             database_path,
             data_dir,
             backup_dir,
+            session: crate::session::SessionPolicy::new(),
+            stopping: AtomicBool::new(false),
             runtime: Mutex::new(RuntimeState {
                 connection: None,
                 key: None,
                 snapshot_warning: None,
+                recovery_notice: None,
             }),
         })
     }
 
     pub fn status(&self) -> SecurityStatus {
-        let runtime = self
+        let mut runtime = self
             .runtime
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        if runtime.connection.is_none() && self.session.snapshot().unlocked {
+            self.session.revoke("databaseUnavailable");
+        }
+        if !self.session.snapshot().unlocked {
+            Self::close_runtime(&mut runtime);
+        }
+        self.status_for_runtime(&runtime)
+    }
+
+    fn status_for_runtime(&self, runtime: &RuntimeState) -> SecurityStatus {
+        let session = self.session.snapshot();
         SecurityStatus {
-            initialized: self.database_path.exists(),
-            unlocked: runtime.connection.is_some(),
+            initialized: self.has_existing_database(),
+            unlocked: runtime.connection.is_some() && session.unlocked,
             database_path: self.database_path.to_string_lossy().to_string(),
             keychain_mode: self.keychain_mode(),
             snapshot_warning: runtime.snapshot_warning.clone(),
+            recovery_notice: runtime.recovery_notice.clone(),
+            session_epoch: session.session_epoch,
+            lock_reason: session.lock_reason,
         }
+    }
+
+    fn has_existing_database(&self) -> bool {
+        fs::symlink_metadata(&self.database_path).is_ok()
+            || crate::restore::has_restore_artifacts(&self.data_dir)
     }
 
     fn keychain_mode(&self) -> String {
@@ -102,6 +128,7 @@ impl AppState {
     }
 
     pub fn unlock(&self) -> CommandResult<SecurityStatus> {
+        let ticket = self.session.challenge()?;
         if self.data_dir.join(PASSWORD_KEY_FILE).exists() {
             return Err(CommandError::new(
                 "PASSWORD_REQUIRED",
@@ -113,19 +140,16 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if runtime.connection.is_some() {
-            return Ok(SecurityStatus {
-                initialized: true,
-                unlocked: true,
-                database_path: self.database_path.to_string_lossy().to_string(),
-                keychain_mode: self.keychain_mode(),
-                snapshot_warning: runtime.snapshot_warning.clone(),
-            });
+            if self.session.require_active().is_ok() {
+                return Ok(self.status_for_runtime(&runtime));
+            }
+            Self::close_runtime(&mut runtime);
         }
 
-        let key = match read_database_key() {
+        let key = Zeroizing::new(match read_database_key() {
             Ok(key) => key,
             Err(error)
-                if error.code() == ERR_SEC_ITEM_NOT_FOUND && !self.database_path.exists() =>
+                if error.code() == ERR_SEC_ITEM_NOT_FOUND && !self.has_existing_database() =>
             {
                 create_database_key(&self.data_dir)?
             }
@@ -136,11 +160,20 @@ impl AppState {
                 )
                 .with_recovery("请完成 Touch ID 或系统密码验证后重试；不要删除现有数据库文件。"));
             }
-        };
+        });
 
+        runtime.recovery_notice = crate::restore::recover_interrupted_restore(
+            &self.data_dir,
+            &self.database_path,
+            &self.backup_dir,
+            &key,
+        )?;
         let connection =
             open_database_with_migration_snapshot(&self.database_path, &key, &self.backup_dir)?;
-        runtime.key = Some(Zeroizing::new(key));
+        let epoch = self
+            .session
+            .activate(ticket, load_settings(&connection)?.lock_minutes)?;
+        runtime.key = Some(key);
         runtime.connection = Some(connection);
 
         runtime.snapshot_warning =
@@ -152,17 +185,16 @@ impl AppState {
                 None
             };
 
-        Ok(SecurityStatus {
-            initialized: true,
-            unlocked: true,
-            database_path: self.database_path.to_string_lossy().to_string(),
-            keychain_mode: self.keychain_mode(),
-            snapshot_warning: runtime.snapshot_warning.clone(),
-        })
+        if let Err(error) = self.session.require_epoch(epoch) {
+            Self::close_runtime(&mut runtime);
+            return Err(error);
+        }
+        Ok(self.status_for_runtime(&runtime))
     }
 
     pub fn initialize_with_password(&self, password: &str) -> CommandResult<SecurityStatus> {
-        if self.database_path.exists() {
+        let ticket = self.session.challenge()?;
+        if self.has_existing_database() {
             return Err(CommandError::new(
                 "ALREADY_INITIALIZED",
                 "工作台已经初始化，不能重新生成数据库密钥",
@@ -171,12 +203,13 @@ impl AppState {
         let mut key = vec![0_u8; 32];
         rand::rng().fill_bytes(&mut key);
         store_password_protected_key(&self.data_dir, &key, password)?;
-        self.open_with_key(key)
+        self.open_with_key(key, ticket)
     }
 
     pub fn unlock_with_password(&self, password: &str) -> CommandResult<SecurityStatus> {
+        let ticket = self.session.challenge()?;
         let key = read_password_protected_key(&self.data_dir, password)?;
-        self.open_with_key(key)
+        self.open_with_key(key, ticket)
     }
 
     pub fn change_local_password(
@@ -184,6 +217,7 @@ impl AppState {
         current_password: &str,
         new_password: &str,
     ) -> CommandResult<SecurityStatus> {
+        let epoch = self.session.require_active()?;
         validate_local_password(current_password)?;
         validate_local_password(new_password)?;
         if current_password == new_password {
@@ -208,6 +242,7 @@ impl AppState {
             .runtime
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        self.session.require_epoch(epoch)?;
         let active_key = runtime.key.as_deref().ok_or_else(CommandError::locked)?;
         let connection = runtime
             .connection
@@ -230,23 +265,37 @@ impl AppState {
         prune_snapshots(&self.backup_dir, "pre-password-change-", 5)?;
         store_password_protected_key(&self.data_dir, &decrypted_key, new_password)?;
 
+        self.session.revoke("passwordChanged");
         runtime.connection = None;
         runtime.key = None;
         runtime.snapshot_warning = None;
-        Ok(self.status_without_lock(false))
+        Ok(self.status_for_runtime(&runtime))
     }
 
-    fn open_with_key(&self, key: Vec<u8>) -> CommandResult<SecurityStatus> {
+    fn open_with_key(&self, key: Vec<u8>, ticket: u64) -> CommandResult<SecurityStatus> {
+        let key = Zeroizing::new(key);
         let mut runtime = self
             .runtime
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if runtime.connection.is_some() {
-            return Ok(self.status_without_lock(true));
+            if self.session.require_active().is_ok() {
+                return Ok(self.status_for_runtime(&runtime));
+            }
+            Self::close_runtime(&mut runtime);
         }
+        runtime.recovery_notice = crate::restore::recover_interrupted_restore(
+            &self.data_dir,
+            &self.database_path,
+            &self.backup_dir,
+            &key,
+        )?;
         let connection =
             open_database_with_migration_snapshot(&self.database_path, &key, &self.backup_dir)?;
-        runtime.key = Some(Zeroizing::new(key));
+        let epoch = self
+            .session
+            .activate(ticket, load_settings(&connection)?.lock_minutes)?;
+        runtime.key = Some(key);
         runtime.connection = Some(connection);
         runtime.snapshot_warning =
             if let (Some(connection), Some(key)) = (&runtime.connection, &runtime.key) {
@@ -256,40 +305,33 @@ impl AppState {
             } else {
                 None
             };
-        Ok(SecurityStatus {
-            initialized: true,
-            unlocked: true,
-            database_path: self.database_path.to_string_lossy().to_string(),
-            keychain_mode: self.keychain_mode(),
-            snapshot_warning: runtime.snapshot_warning.clone(),
-        })
-    }
-
-    fn status_without_lock(&self, unlocked: bool) -> SecurityStatus {
-        SecurityStatus {
-            initialized: self.database_path.exists(),
-            unlocked,
-            database_path: self.database_path.to_string_lossy().to_string(),
-            keychain_mode: self.keychain_mode(),
-            snapshot_warning: None,
+        if let Err(error) = self.session.require_epoch(epoch) {
+            Self::close_runtime(&mut runtime);
+            return Err(error);
         }
+        Ok(self.status_for_runtime(&runtime))
     }
 
     pub fn lock(&self) -> SecurityStatus {
+        self.session.revoke("manual");
         let mut runtime = self
             .runtime
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(connection) = runtime.connection.take() {
-            let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        }
+        Self::close_runtime(&mut runtime);
+        self.status_for_runtime(&runtime)
+    }
+
+    fn close_runtime(runtime: &mut RuntimeState) {
         runtime.key = None;
-        SecurityStatus {
-            initialized: self.database_path.exists(),
-            unlocked: false,
-            database_path: self.database_path.to_string_lossy().to_string(),
-            keychain_mode: self.keychain_mode(),
-            snapshot_warning: runtime.snapshot_warning.clone(),
+        runtime.connection = None;
+    }
+
+    pub(crate) fn close_revoked_session(&self) {
+        if let Ok(mut runtime) = self.runtime.try_lock()
+            && !self.session.snapshot().unlocked
+        {
+            Self::close_runtime(&mut runtime);
         }
     }
 
@@ -297,30 +339,38 @@ impl AppState {
         &self,
         operation: impl FnOnce(&Connection) -> CommandResult<T>,
     ) -> CommandResult<T> {
+        let epoch = self.session.require_active()?;
         let runtime = self
             .runtime
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        self.session.require_epoch(epoch)?;
         let connection = runtime
             .connection
             .as_ref()
             .ok_or_else(CommandError::locked)?;
-        operation(connection)
+        let result = operation(connection);
+        self.session.require_epoch(epoch)?;
+        result
     }
 
     pub fn with_connection_mut<T>(
         &self,
         operation: impl FnOnce(&mut Connection) -> CommandResult<T>,
     ) -> CommandResult<T> {
+        let epoch = self.session.require_active()?;
         let mut runtime = self
             .runtime
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        self.session.require_epoch(epoch)?;
         let connection = runtime
             .connection
             .as_mut()
             .ok_or_else(CommandError::locked)?;
-        operation(connection)
+        let result = operation(connection);
+        self.session.require_epoch(epoch)?;
+        result
     }
 }
 
@@ -503,6 +553,35 @@ pub fn get_tushare_token() -> CommandResult<String> {
 
 pub(crate) fn open_cipher_connection(path: &Path, key: &[u8]) -> CommandResult<Connection> {
     let connection = Connection::open(path)?;
+    configure_cipher_connection(connection, key)
+}
+
+pub(crate) fn open_cipher_connection_read_only(
+    path: &Path,
+    key: &[u8],
+) -> CommandResult<Connection> {
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    // SQLite can create WAL/SHM even for a read-only connection to a WAL-mode database.
+    // A closed, checkpointed candidate has no sidecars and must be inspected without creating them.
+    let no_sidecars = ["-wal", "-shm"].iter().all(|suffix| {
+        fs::symlink_metadata(PathBuf::from(format!("{}{}", path.display(), suffix)))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+    let open_path = if no_sidecars {
+        let absolute = std::path::absolute(path)?;
+        let mut uri = reqwest::Url::from_file_path(&absolute)
+            .map_err(|_| CommandError::new("INVALID_DATABASE_PATH", "无法解析数据库文件路径"))?;
+        uri.set_query(Some("immutable=1"));
+        flags |= OpenFlags::SQLITE_OPEN_URI;
+        PathBuf::from(uri.as_str())
+    } else {
+        path.to_owned()
+    };
+    let connection = Connection::open_with_flags(open_path, flags)?;
+    configure_cipher_connection(connection, key)
+}
+
+fn configure_cipher_connection(connection: Connection, key: &[u8]) -> CommandResult<Connection> {
     let key_hex = hex::encode(key);
     connection.execute_batch(&format!(
         "PRAGMA key = \"x'{key_hex}'\";\
@@ -1037,6 +1116,173 @@ pub fn validate_connection(connection: &Connection) -> CommandResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unlocked_fixture() -> (tempfile::TempDir, AppState) {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let key = vec![71; 32];
+        let connection = open_database(&state.database_path, &key).unwrap();
+        {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.connection = Some(connection);
+            runtime.key = Some(Zeroizing::new(key));
+        }
+        state.session.activate(0, 0).unwrap();
+        (directory, state)
+    }
+
+    #[test]
+    fn native_lock_revokes_access_without_waiting_for_database_and_closes_when_released() {
+        let (_directory, state) = unlocked_fixture();
+        let guard = state.runtime.lock().unwrap();
+        // This must not acquire the database mutex: a native callback cannot wait for SQL.
+        state
+            .session
+            .system_event(crate::session::SystemEvent::ScreenLocked);
+        assert_eq!(
+            state.with_connection(|_| Ok(())).unwrap_err().code,
+            "APP_LOCKED"
+        );
+        state.close_revoked_session(); // try-lock; returns rather than blocking on our guard.
+        assert!(guard.connection.is_some());
+        drop(guard);
+        state.close_revoked_session();
+        let runtime = state.runtime.lock().unwrap();
+        assert!(runtime.key.is_none() && runtime.connection.is_none());
+        drop(runtime);
+        assert!(!state.status().unlocked);
+    }
+
+    #[test]
+    fn response_after_lock_is_discarded_but_started_transaction_finishes_safely() {
+        let (_directory, state) = unlocked_fixture();
+        let error = state.with_connection(|db| {
+            db.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('p','committed','work','active','#000','','now','now')", [])?;
+            state.session.revoke("system");
+            Ok("sensitive response")
+        }).unwrap_err();
+        assert_eq!(error.code, "APP_LOCKED");
+        assert!(state.with_connection(|_| Ok(())).is_err());
+        state.close_revoked_session();
+        let db = open_database(&state.database_path, &[71; 32]).unwrap();
+        let name: String = db
+            .query_row("SELECT name FROM projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "committed");
+    }
+
+    #[test]
+    fn unlock_started_before_system_lock_cannot_install_key_or_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let key = vec![72; 32];
+        drop(open_database(&state.database_path, &key).unwrap());
+        let ticket = state.session.challenge().unwrap();
+        state
+            .session
+            .system_event(crate::session::SystemEvent::ScreenLocked);
+        state
+            .session
+            .system_event(crate::session::SystemEvent::ScreenUnlocked);
+        assert_eq!(
+            state.open_with_key(key.clone(), ticket).unwrap_err().code,
+            "APP_LOCKED"
+        );
+        let runtime = state.runtime.lock().unwrap();
+        assert!(runtime.connection.is_none() && runtime.key.is_none());
+        drop(runtime);
+        assert!(
+            state
+                .open_with_key(key, state.session.challenge().unwrap())
+                .unwrap()
+                .unlocked
+        );
+    }
+
+    #[test]
+    fn expired_backend_session_rejects_reads_and_writes_without_javascript() {
+        let (_directory, state) = unlocked_fixture();
+        state.session.configure(5).unwrap();
+        state.session.age_for_test(301);
+        assert_eq!(
+            state.with_connection(|_| Ok(())).unwrap_err().code,
+            "APP_LOCKED"
+        );
+        assert_eq!(
+            state.with_connection_mut(|_| Ok(())).unwrap_err().code,
+            "APP_LOCKED"
+        );
+        assert!(state.session.activity().is_err());
+        state.close_revoked_session();
+        assert!(state.runtime.lock().unwrap().key.is_none());
+    }
+
+    #[test]
+    fn missing_connection_cannot_leave_authorization_and_key_active() {
+        let (_directory, state) = unlocked_fixture();
+        state.runtime.lock().unwrap().connection = None;
+        let status = state.status();
+        assert!(!status.unlocked);
+        assert_eq!(status.lock_reason.as_deref(), Some("databaseUnavailable"));
+        assert!(state.runtime.lock().unwrap().key.is_none());
+        assert!(state.session.require_active().is_err());
+    }
+
+    #[test]
+    fn legacy_restore_artifacts_block_initialization_and_recover_on_password_unlock() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let key = [63; 32];
+        store_password_protected_key(&state.data_dir, &key, "original passphrase").unwrap();
+        let previous = state.data_dir.join(crate::restore::PREVIOUS_DATABASE);
+        let connection = open_database(&previous, &key).unwrap();
+        connection.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('p','original data','work','active','#000','','now','now')", []).unwrap();
+        drop(connection);
+        let key_bytes = fs::read(state.data_dir.join(PASSWORD_KEY_FILE)).unwrap();
+        let database_bytes = fs::read(&previous).unwrap();
+        assert!(state.status().initialized);
+        assert_eq!(
+            state
+                .initialize_with_password("replacement password")
+                .unwrap_err()
+                .code,
+            "ALREADY_INITIALIZED"
+        );
+        assert_eq!(
+            state
+                .unlock_with_password("incorrect password")
+                .unwrap_err()
+                .code,
+            "LOCAL_PASSWORD_INCORRECT"
+        );
+        assert_eq!(fs::read(&previous).unwrap(), database_bytes);
+        assert_eq!(
+            fs::read(state.data_dir.join(PASSWORD_KEY_FILE)).unwrap(),
+            key_bytes
+        );
+        assert!(!state.database_path.exists());
+        let unlocked = state.unlock_with_password("original passphrase").unwrap();
+        assert!(unlocked.initialized && unlocked.unlocked);
+        assert!(unlocked.recovery_notice.unwrap().contains("回滚"));
+        let name: String = state
+            .with_connection(|db| {
+                Ok(db.query_row("SELECT name FROM projects", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(name, "original data");
+        assert_eq!(
+            fs::read(state.data_dir.join(PASSWORD_KEY_FILE)).unwrap(),
+            key_bytes
+        );
+        state.lock();
+        assert!(
+            state
+                .unlock_with_password("original passphrase")
+                .unwrap()
+                .recovery_notice
+                .is_none()
+        );
+    }
 
     #[test]
     fn local_password_minimum_is_six_characters() {

@@ -48,6 +48,10 @@ export async function call<T>(command: string, args?: Record<string, unknown>): 
       throw error;
     }
   } catch (error) {
-    throw new WorkbenchError(error);
+    const normalized = new WorkbenchError(error);
+    if (normalized.code === "APP_LOCKED" && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("workbench:security-check"));
+    }
+    throw normalized;
   }
 }

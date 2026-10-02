@@ -24,6 +24,13 @@ export const securityStatusSchema = z.object({
   databasePath: z.string(),
   keychainMode: z.enum(["userPresence", "loginKeychain", "passphrase"]),
   snapshotWarning: optionalString,
+  recoveryNotice: optionalString,
+  sessionEpoch: z.number().int().nonnegative(),
+  lockReason: optionalString,
+});
+
+export const lockEventSchema = z.object({
+  sessionEpoch: z.number().int().nonnegative(), unlocked: z.literal(false), lockReason: optionalString,
 });
 
 export const taskSchema = z.object({
@@ -150,6 +157,7 @@ const responseSchemas: Record<string, z.ZodType> = {
   security_status: securityStatusSchema, security_unlock: securityStatusSchema,
   security_initialize_with_password: securityStatusSchema, security_unlock_with_password: securityStatusSchema,
   security_change_password: securityStatusSchema, security_lock: securityStatusSchema,
+  security_activity: z.null(),
   get_dashboard: dashboardSchema,
   list_tasks: z.array(taskSchema), upsert_task: taskSchema, toggle_task: taskSchema,
   list_calendar_items: z.array(calendarSchema), upsert_calendar_item: calendarSchema,

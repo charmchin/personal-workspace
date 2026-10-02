@@ -8,6 +8,9 @@ pub struct SecurityStatus {
     pub database_path: String,
     pub keychain_mode: String,
     pub snapshot_warning: Option<String>,
+    pub recovery_notice: Option<String>,
+    pub session_epoch: u64,
+    pub lock_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

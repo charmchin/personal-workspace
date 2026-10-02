@@ -18,6 +18,7 @@ use crate::{
     },
     error::{CommandError, CommandResult},
     models::{BackupInfo, BackupManifest},
+    restore::{self, PREVIOUS_DATABASE, STAGED_DATABASE},
 };
 
 const BACKUP_FORMAT_VERSION: i64 = 1;
@@ -70,6 +71,7 @@ pub fn export_backup(
     destination: &Path,
     password: &str,
 ) -> CommandResult<BackupManifest> {
+    let epoch = state.session.require_active()?;
     validate_password(password)?;
     if destination.extension().and_then(|value| value.to_str()) != Some("workbench-backup") {
         return Err(CommandError::new(
@@ -118,6 +120,10 @@ pub fn export_backup(
             format!("无法完成备份加密：{error}"),
         )
     })?;
+    if let Err(error) = state.session.require_epoch(epoch) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     fs::rename(&temporary, destination)?;
     restrict_file_permissions(destination)?;
     Ok(manifest)
@@ -242,28 +248,75 @@ fn reopen_current_database(
     Ok(())
 }
 
+fn ensure_no_pending_restore(state: &AppState) -> CommandResult<()> {
+    if restore::has_restore_artifacts(&state.data_dir) {
+        return Err(CommandError::new(
+            "RESTORE_RECOVERY_PENDING",
+            "检测到尚未处理的恢复文件，已停止新的恢复",
+        )
+        .with_recovery("请先锁定并重新解锁，系统将验证并处理遗留恢复文件。"));
+    }
+    Ok(())
+}
+
 fn replace_database_from_temporary(
     state: &AppState,
     runtime: &mut RuntimeState,
     key: &[u8],
     temporary: &Path,
 ) -> CommandResult<()> {
-    let replaced = state.data_dir.join("database-before-restore.sqlite3.tmp");
-    if replaced.exists() {
-        fs::remove_file(&replaced)?;
+    replace_database_with_checkpoints(state, runtime, key, temporary, |_| {})
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestoreCheckpoint {
+    PreviousPersisted,
+    Replaced,
+    Reopened,
+    Finalized,
+}
+
+fn replace_database_with_checkpoints(
+    state: &AppState,
+    runtime: &mut RuntimeState,
+    key: &[u8],
+    temporary: &Path,
+    mut checkpoint: impl FnMut(RestoreCheckpoint),
+) -> CommandResult<()> {
+    let replaced = state.data_dir.join(PREVIOUS_DATABASE);
+    if fs::symlink_metadata(&replaced).is_ok() {
+        return Err(CommandError::new(
+            "RESTORE_RECOVERY_PENDING",
+            "检测到尚未处理的恢复前数据库，已停止新的恢复",
+        )
+        .with_recovery("请先锁定并重新解锁，系统将验证并处理遗留恢复文件。"));
     }
+    // Persist the validated candidate before the original database is touched.
+    restore::sync_database(temporary)?;
+    restore::sync_directory(&state.data_dir)?;
     let current = runtime
         .connection
         .as_ref()
         .ok_or_else(CommandError::locked)?;
-    current.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let busy: i64 = current.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(CommandError::new(
+            "RESTORE_DATABASE_BUSY",
+            "数据库仍被其他操作占用，已停止恢复",
+        )
+        .with_recovery("请关闭其他工作台窗口或开发副本后重试。"));
+    }
     runtime.connection = None;
 
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{}", state.database_path.display(), suffix));
-        if sidecar.exists()
-            && let Err(error) = fs::remove_file(&sidecar)
-        {
+        let cleanup = restrict_file_permissions(&sidecar).and_then(|_| {
+            if sidecar.exists() {
+                fs::remove_file(&sidecar)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = cleanup {
             reopen_current_database(state, runtime, key)?;
             return Err(CommandError::new(
                 "RESTORE_SIDECAR_CLEANUP_FAILED",
@@ -273,56 +326,60 @@ fn replace_database_from_temporary(
         }
     }
 
-    if let Err(error) = fs::rename(&state.database_path, &replaced) {
+    // A separately persisted copy permits rollback without ever removing the main path.
+    let preparation = restore::sync_database(&state.database_path)
+        .and_then(|_| restore::copy_database(&state.database_path, &replaced))
+        .and_then(|_| restore::sync_directory(&state.data_dir));
+    if let Err(error) = preparation {
         reopen_current_database(state, runtime, key)?;
         return Err(CommandError::new(
             "RESTORE_PREPARE_FAILED",
             format!("无法准备数据库替换：{error}"),
-        ));
+        )
+        .with_recovery("当前数据库未被替换；请锁定并重新解锁后重试。"));
     }
+    checkpoint(RestoreCheckpoint::PreviousPersisted);
     if let Err(error) = fs::rename(temporary, &state.database_path) {
-        fs::rename(&replaced, &state.database_path).map_err(|rollback| {
-            CommandError::new(
-                "RESTORE_ROLLBACK_FAILED",
-                format!("数据库替换失败且无法自动回滚：{error}；回滚错误：{rollback}"),
-            )
-            .with_recovery("请勿继续操作，保留数据目录并使用恢复前快照。")
-        })?;
         reopen_current_database(state, runtime, key)?;
         return Err(CommandError::new(
             "RESTORE_REPLACE_FAILED",
             format!("替换数据库失败：{error}"),
-        ));
+        )
+        .with_recovery("原数据库仍保留在主路径，请锁定并重新解锁后重试。"));
     }
-
-    match open_database(&state.database_path, key) {
+    checkpoint(RestoreCheckpoint::Replaced);
+    let reopened = restore::sync_directory(&state.data_dir)
+        .and_then(|_| open_database(&state.database_path, key));
+    match reopened {
         Ok(connection) => runtime.connection = Some(connection),
         Err(open_error) => {
-            fs::remove_file(&state.database_path).map_err(|remove_error| {
+            restore::rollback_to_previous(
+                &state.data_dir,
+                &state.database_path,
+                &state.backup_dir,
+                key,
+            )
+            .map_err(|rollback| {
                 CommandError::new(
                     "RESTORE_ROLLBACK_FAILED",
-                    format!("新数据库无法打开，且无法移除以执行回滚：{open_error}; {remove_error}"),
+                    format!("新数据库无法打开或持久化，回滚失败：{open_error}; {rollback}"),
                 )
-                .with_recovery("请勿继续操作，保留数据目录并使用恢复前快照。")
-            })?;
-            fs::rename(&replaced, &state.database_path).map_err(|rollback| {
-                CommandError::new(
-                    "RESTORE_ROLLBACK_FAILED",
-                    format!("新数据库无法打开，回滚旧数据库失败：{open_error}; {rollback}"),
-                )
-                .with_recovery("请勿继续操作，保留数据目录并使用恢复前快照。")
+                .with_recovery("全部候选文件均保留，请锁定并重新打开工作台以验证恢复状态。")
             })?;
             reopen_current_database(state, runtime, key)?;
             return Err(CommandError::new(
                 "RESTORE_OPEN_FAILED",
-                format!("恢复后的数据库无法打开：{open_error}"),
+                format!("恢复未能完成，已回滚原数据库：{open_error}"),
             ));
         }
     }
-    if replaced.exists() {
+    checkpoint(RestoreCheckpoint::Reopened);
+    if fs::symlink_metadata(&replaced).is_ok() {
         // 恢复已成功时，旧临时库的清理失败不应被误报为恢复失败。
         let _ = fs::remove_file(replaced);
+        let _ = restore::sync_directory(&state.data_dir);
     }
+    checkpoint(RestoreCheckpoint::Finalized);
     Ok(())
 }
 
@@ -360,6 +417,7 @@ pub fn restore_backup(
     source: &Path,
     password: &str,
 ) -> CommandResult<BackupManifest> {
+    let epoch = state.session.require_active()?;
     let (manifest, bytes) = read_backup(source, password)?;
     let bytes = Zeroizing::new(bytes);
     let mut memory = Connection::open_in_memory()?;
@@ -377,6 +435,7 @@ pub fn restore_backup(
         .runtime
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    state.session.require_epoch(epoch)?;
     let key = Zeroizing::new(
         runtime
             .key
@@ -384,7 +443,8 @@ pub fn restore_backup(
             .ok_or_else(CommandError::locked)?
             .to_vec(),
     );
-    let temporary = state.data_dir.join("restore.sqlite3.tmp");
+    ensure_no_pending_restore(state)?;
+    let temporary = state.data_dir.join(STAGED_DATABASE);
     remove_temporary_database(&temporary);
     let preparation = export_encrypted_copy(&memory, &key, &temporary)
         .and_then(|_| validate_temporary_database(&temporary, &key).map(|_| ()));
@@ -397,19 +457,34 @@ pub fn restore_backup(
         .as_ref()
         .ok_or_else(CommandError::locked)?;
     create_restore_point(state, current, &key)?;
+    state.session.require_epoch(epoch)?;
     if let Err(error) = replace_database_from_temporary(state, &mut runtime, &key, &temporary) {
-        remove_temporary_database(&temporary);
+        if !state.data_dir.join(PREVIOUS_DATABASE).exists() {
+            remove_temporary_database(&temporary);
+        }
         return Err(error);
     }
+    state.session.require_epoch(epoch)?;
+    state.session.configure(
+        crate::database::load_settings(
+            runtime
+                .connection
+                .as_ref()
+                .ok_or_else(CommandError::locked)?,
+        )?
+        .lock_minutes,
+    )?;
     Ok(manifest)
 }
 
 pub fn restore_snapshot(state: &AppState, name: &str) -> CommandResult<i64> {
+    let epoch = state.session.require_active()?;
     let source = snapshot_path(state, name)?;
     let mut runtime = state
         .runtime
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    state.session.require_epoch(epoch)?;
     let key = Zeroizing::new(
         runtime
             .key
@@ -417,7 +492,8 @@ pub fn restore_snapshot(state: &AppState, name: &str) -> CommandResult<i64> {
             .ok_or_else(CommandError::locked)?
             .to_vec(),
     );
-    let temporary = state.data_dir.join("restore.sqlite3.tmp");
+    ensure_no_pending_restore(state)?;
+    let temporary = state.data_dir.join(STAGED_DATABASE);
     remove_temporary_database(&temporary);
     fs::copy(source, &temporary)?;
     restrict_file_permissions(&temporary)?;
@@ -433,10 +509,23 @@ pub fn restore_snapshot(state: &AppState, name: &str) -> CommandResult<i64> {
         .as_ref()
         .ok_or_else(CommandError::locked)?;
     create_restore_point(state, current, &key)?;
+    state.session.require_epoch(epoch)?;
     if let Err(error) = replace_database_from_temporary(state, &mut runtime, &key, &temporary) {
-        remove_temporary_database(&temporary);
+        if !state.data_dir.join(PREVIOUS_DATABASE).exists() {
+            remove_temporary_database(&temporary);
+        }
         return Err(error);
     }
+    state.session.require_epoch(epoch)?;
+    state.session.configure(
+        crate::database::load_settings(
+            runtime
+                .connection
+                .as_ref()
+                .ok_or_else(CommandError::locked)?,
+        )?
+        .lock_minutes,
+    )?;
     Ok(record_count)
 }
 
@@ -488,6 +577,174 @@ mod tests {
     use super::*;
     use zeroize::Zeroizing;
 
+    fn crash_fixture(path: &Path, name: &str) {
+        let connection = open_database(path, &[64; 32]).unwrap();
+        connection.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('p',?1,'work','active','#000','','now','now')", [name]).unwrap();
+        drop(connection);
+    }
+
+    // Run only in the isolated child below. process::exit deliberately skips SQLite destructors.
+    #[test]
+    #[ignore = "subprocess helper for interrupted_restore_survives_process_exit_at_each_checkpoint"]
+    fn interrupted_restore_child() {
+        let Some(directory) = std::env::var_os("WORKBENCH_RESTORE_TEST_DIR") else {
+            return;
+        };
+        let phase = std::env::var("WORKBENCH_RESTORE_TEST_CHECKPOINT").unwrap();
+        let state = AppState::new(PathBuf::from(directory)).unwrap();
+        let key = [64; 32];
+        let mut runtime = state.runtime.lock().unwrap();
+        runtime.connection = Some(open_database(&state.database_path, &key).unwrap());
+        runtime.key = Some(Zeroizing::new(key.to_vec()));
+        state.session.activate(0, 0).unwrap();
+        replace_database_with_checkpoints(
+            &state,
+            &mut runtime,
+            &key,
+            &state.data_dir.join(STAGED_DATABASE),
+            |checkpoint| {
+                assert!(
+                    state.database_path.is_file(),
+                    "primary must never disappear"
+                );
+                if format!("{checkpoint:?}") == phase {
+                    std::process::exit(86);
+                }
+            },
+        )
+        .unwrap();
+        panic!("requested crash checkpoint was not reached");
+    }
+
+    #[test]
+    fn interrupted_restore_survives_process_exit_at_each_checkpoint() {
+        for phase in [
+            RestoreCheckpoint::PreviousPersisted,
+            RestoreCheckpoint::Replaced,
+            RestoreCheckpoint::Reopened,
+            RestoreCheckpoint::Finalized,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = AppState::new(directory.path().to_owned()).unwrap();
+            crash_fixture(&state.database_path, "before");
+            crash_fixture(&state.data_dir.join(STAGED_DATABASE), "after");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::interrupted_restore_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("WORKBENCH_RESTORE_TEST_DIR", directory.path())
+                .env("WORKBENCH_RESTORE_TEST_CHECKPOINT", format!("{phase:?}"))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{phase:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(state.database_path.is_file());
+            let restarted = AppState::new(directory.path().to_owned()).unwrap();
+            assert!(restarted.status().initialized);
+            restore::recover_interrupted_restore(
+                &restarted.data_dir,
+                &restarted.database_path,
+                &restarted.backup_dir,
+                &[64; 32],
+            )
+            .unwrap();
+            let connection = open_database(&restarted.database_path, &[64; 32]).unwrap();
+            let name: String = connection
+                .query_row("SELECT name FROM projects", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                name,
+                if phase == RestoreCheckpoint::PreviousPersisted {
+                    "before"
+                } else {
+                    "after"
+                },
+                "{phase:?}"
+            );
+            assert!(!restore::has_restore_artifacts(&restarted.data_dir));
+            drop(connection);
+            assert!(
+                restore::recover_interrupted_restore(
+                    &restarted.data_dir,
+                    &restarted.database_path,
+                    &restarted.backup_dir,
+                    &[64; 32]
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn new_restore_does_not_erase_pending_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let key = [64; 32];
+        crash_fixture(&state.database_path, "current");
+        let snapshot = "daily-2026-10-02.sqlite3";
+        crash_fixture(&state.backup_dir.join(snapshot), "snapshot");
+        let connection = open_database(&state.database_path, &key).unwrap();
+        {
+            let mut runtime = state.runtime.lock().unwrap();
+            runtime.connection = Some(connection);
+            runtime.key = Some(Zeroizing::new(key.to_vec()));
+            state.session.activate(0, 0).unwrap();
+        }
+        let staged = state.data_dir.join(STAGED_DATABASE);
+        fs::write(&staged, b"do not erase").unwrap();
+        assert_eq!(
+            restore_snapshot(&state, snapshot).unwrap_err().code,
+            "RESTORE_RECOVERY_PENDING"
+        );
+        assert_eq!(fs::read(staged).unwrap(), b"do not erase");
+        assert!(state.status().unlocked);
+    }
+
+    #[test]
+    fn failed_reopen_rolls_back_without_discarding_damaged_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let key = [64; 32];
+        crash_fixture(&state.database_path, "before");
+        let staged = state.data_dir.join(STAGED_DATABASE);
+        crash_fixture(&staged, "after");
+        let mut runtime = state.runtime.lock().unwrap();
+        runtime.connection = Some(open_database(&state.database_path, &key).unwrap());
+        runtime.key = Some(Zeroizing::new(key.to_vec()));
+        state.session.activate(0, 0).unwrap();
+        let error =
+            replace_database_with_checkpoints(&state, &mut runtime, &key, &staged, |phase| {
+                if phase == RestoreCheckpoint::PreviousPersisted {
+                    fs::write(&staged, b"damaged after validation").unwrap();
+                }
+                assert!(state.database_path.exists());
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "RESTORE_OPEN_FAILED");
+        let name: String = runtime
+            .connection
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT name FROM projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "before");
+        drop(runtime);
+        let backups = list_backups(&state).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read(state.backup_dir.join(&backups[0].name)).unwrap(),
+            b"damaged after validation"
+        );
+    }
+
     #[test]
     fn short_backup_password_is_rejected() {
         assert!(validate_password("too-short").is_err());
@@ -505,6 +762,7 @@ mod tests {
             let mut runtime = state.runtime.lock().unwrap();
             runtime.connection = Some(connection);
             runtime.key = Some(Zeroizing::new(key));
+            state.session.activate(0, 0).unwrap();
         }
 
         let backup_path = directory.path().join("roundtrip.workbench-backup");
@@ -599,6 +857,7 @@ mod tests {
             let mut runtime = state.runtime.lock().unwrap();
             runtime.connection = Some(connection);
             runtime.key = Some(Zeroizing::new(key));
+            state.session.activate(0, 0).unwrap();
         }
 
         let count = restore_snapshot(&state, snapshot_name).unwrap();
@@ -632,6 +891,7 @@ mod tests {
             let mut runtime = state.runtime.lock().unwrap();
             runtime.connection = Some(connection);
             runtime.key = Some(Zeroizing::new(key));
+            state.session.activate(0, 0).unwrap();
         }
         let snapshot_name = "daily-2026-08-31.sqlite3";
         fs::write(state.backup_dir.join(snapshot_name), b"corrupted").unwrap();

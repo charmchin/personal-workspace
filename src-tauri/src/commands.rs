@@ -50,17 +50,17 @@ fn validate_input_file(path: &str, extension: &str, max_bytes: u64) -> CommandRe
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn security_status(state: State<'_, AppState>) -> SecurityStatus {
     state.status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn security_unlock(state: State<'_, AppState>) -> CommandResult<SecurityStatus> {
     state.unlock()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn security_initialize_with_password(
     state: State<'_, AppState>,
     password: String,
@@ -68,7 +68,7 @@ pub fn security_initialize_with_password(
     state.initialize_with_password(&password)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn security_unlock_with_password(
     state: State<'_, AppState>,
     password: String,
@@ -76,7 +76,7 @@ pub fn security_unlock_with_password(
     state.unlock_with_password(&password)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn security_change_password(
     state: State<'_, AppState>,
     current_password: String,
@@ -85,32 +85,37 @@ pub fn security_change_password(
     state.change_local_password(&current_password, &new_password)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn security_lock(state: State<'_, AppState>) -> SecurityStatus {
     state.lock()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
+pub fn security_activity(state: State<'_, AppState>) -> CommandResult<()> {
+    state.session.activity()
+}
+
+#[tauri::command(async)]
 pub fn get_dashboard(state: State<'_, AppState>, date: String) -> CommandResult<Dashboard> {
     state.with_connection(|connection| repository::dashboard(connection, &date))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_tasks(state: State<'_, AppState>) -> CommandResult<Vec<Task>> {
     state.with_connection(repository::list_tasks)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_task(state: State<'_, AppState>, task: Task) -> CommandResult<Task> {
     state.with_connection(|connection| repository::upsert_task(connection, task))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn toggle_task(state: State<'_, AppState>, id: String, completed: bool) -> CommandResult<Task> {
     state.with_connection(|connection| repository::toggle_task(connection, &id, completed))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_calendar_items(
     state: State<'_, AppState>,
     start: Option<String>,
@@ -121,7 +126,7 @@ pub fn list_calendar_items(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_calendar_item(
     state: State<'_, AppState>,
     item: CalendarItem,
@@ -129,47 +134,47 @@ pub fn upsert_calendar_item(
     state.with_connection(|connection| repository::upsert_calendar(connection, item))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_projects(state: State<'_, AppState>) -> CommandResult<Vec<Project>> {
     state.with_connection(repository::list_projects)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_project(state: State<'_, AppState>, project: Project) -> CommandResult<Project> {
     state.with_connection(|connection| repository::upsert_project(connection, project))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_work_logs(state: State<'_, AppState>) -> CommandResult<Vec<WorkLog>> {
     state.with_connection(repository::list_work_logs)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_work_log(state: State<'_, AppState>, log: WorkLog) -> CommandResult<WorkLog> {
     state.with_connection(|connection| repository::upsert_work_log(connection, log))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_goals(state: State<'_, AppState>) -> CommandResult<Vec<Goal>> {
     state.with_connection(repository::list_goals)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_goal(state: State<'_, AppState>, goal: Goal) -> CommandResult<Goal> {
     state.with_connection(|connection| repository::upsert_goal(connection, goal))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_habits(state: State<'_, AppState>, date: String) -> CommandResult<Vec<Habit>> {
     state.with_connection(|connection| repository::list_habits(connection, &date))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_habit(state: State<'_, AppState>, habit: Habit) -> CommandResult<Habit> {
     state.with_connection(|connection| repository::upsert_habit(connection, habit))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn check_habit(
     state: State<'_, AppState>,
     habit_id: String,
@@ -181,12 +186,12 @@ pub fn check_habit(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_learning_items(state: State<'_, AppState>) -> CommandResult<Vec<LearningItem>> {
     state.with_connection(repository::list_learning)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_learning_item(
     state: State<'_, AppState>,
     item: LearningItem,
@@ -194,12 +199,12 @@ pub fn upsert_learning_item(
     state.with_connection(|connection| repository::upsert_learning(connection, item))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_content_items(state: State<'_, AppState>) -> CommandResult<Vec<ContentItem>> {
     state.with_connection(repository::list_content)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_content_item(
     state: State<'_, AppState>,
     item: ContentItem,
@@ -207,7 +212,7 @@ pub fn upsert_content_item(
     state.with_connection(|connection| repository::upsert_content(connection, item))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_content_metric(
     state: State<'_, AppState>,
     metric: ContentMetricInput,
@@ -215,14 +220,14 @@ pub fn add_content_metric(
     state.with_connection(|connection| repository::add_content_metric(connection, metric))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_investment_accounts(
     state: State<'_, AppState>,
 ) -> CommandResult<Vec<InvestmentAccount>> {
     state.with_connection(repository::list_accounts)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_investment_account(
     state: State<'_, AppState>,
     account: InvestmentAccount,
@@ -230,12 +235,12 @@ pub fn upsert_investment_account(
     state.with_connection(|connection| repository::upsert_account(connection, account))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_instruments(state: State<'_, AppState>) -> CommandResult<Vec<Instrument>> {
     state.with_connection(repository::list_instruments)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_instrument(
     state: State<'_, AppState>,
     instrument: Instrument,
@@ -243,14 +248,14 @@ pub fn upsert_instrument(
     state.with_connection(|connection| repository::upsert_instrument(connection, instrument))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_portfolio_transactions(
     state: State<'_, AppState>,
 ) -> CommandResult<Vec<PortfolioTransaction>> {
     state.with_connection(repository::list_transactions)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_portfolio_transaction(
     state: State<'_, AppState>,
     transaction: PortfolioTransaction,
@@ -258,22 +263,22 @@ pub fn upsert_portfolio_transaction(
     state.with_connection(|connection| repository::upsert_transaction(connection, transaction))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_price_point(state: State<'_, AppState>, price: PricePointInput) -> CommandResult<()> {
     state.with_connection(|connection| repository::upsert_price(connection, price))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_portfolio_snapshot(state: State<'_, AppState>) -> CommandResult<PortfolioSnapshot> {
     state.with_connection(repository::portfolio_snapshot)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_reviews(state: State<'_, AppState>) -> CommandResult<Vec<ReviewSnapshot>> {
     state.with_connection(repository::list_reviews)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_review(
     state: State<'_, AppState>,
     review: ReviewSnapshot,
@@ -281,7 +286,7 @@ pub fn upsert_review(
     state.with_connection(|connection| repository::upsert_review(connection, review))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn generate_weekly_summary(
     state: State<'_, AppState>,
     start_date: String,
@@ -292,12 +297,12 @@ pub fn generate_weekly_summary(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_record(state: State<'_, AppState>, kind: String, id: String) -> CommandResult<()> {
     state.with_connection(|connection| repository::delete_record(connection, &kind, &id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_saved_file(state: State<'_, AppState>, path: String) -> CommandResult<()> {
     let allowed = state
         .with_connection(|connection| repository::is_saved_file_reference(connection, &path))?;
@@ -336,7 +341,7 @@ pub fn open_saved_file(state: State<'_, AppState>, path: String) -> CommandResul
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn search_records(
     state: State<'_, AppState>,
     query: String,
@@ -344,25 +349,28 @@ pub fn search_records(
     state.with_connection(|connection| repository::search(connection, &query))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_settings(state: State<'_, AppState>) -> CommandResult<AppSettings> {
     state.with_connection(repository::settings)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> CommandResult<AppSettings> {
-    state.with_connection(|connection| repository::update_settings(connection, settings))
+    let updated =
+        state.with_connection(|connection| repository::update_settings(connection, settings))?;
+    state.session.configure(updated.lock_minutes)?;
+    Ok(updated)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn configure_tushare_token(token: String) -> CommandResult<()> {
     set_tushare_token(&token)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn has_tushare_token() -> bool {
     get_tushare_token().is_ok()
 }
@@ -484,6 +492,7 @@ async fn fetch_tushare_price(
 pub async fn refresh_tushare_quotes(
     state: State<'_, AppState>,
 ) -> CommandResult<QuoteRefreshReport> {
+    let epoch = state.session.require_active()?;
     let token = get_tushare_token()?;
     let (settings, instruments) = state.with_connection(|connection| {
         Ok((
@@ -507,6 +516,7 @@ pub async fn refresh_tushare_quotes(
         .filter(|instrument| instrument.kind != "cash")
         .take(100)
     {
+        state.session.require_epoch(epoch)?;
         match fetch_tushare_price(&client, &token, &instrument).await {
             Ok((date, price)) => prices.push(PricePointInput {
                 instrument_id: instrument.id,
@@ -516,10 +526,12 @@ pub async fn refresh_tushare_quotes(
             }),
             Err(error) => errors.push(format!("{}：{}", instrument.code, error.message)),
         }
+        state.session.require_epoch(epoch)?;
     }
     let refreshed_at = now_utc();
     let updated = prices.len();
     state.with_connection(|connection| {
+        state.session.require_epoch(epoch)?;
         for price in prices {
             repository::upsert_price(connection, price)?;
         }
@@ -593,7 +605,7 @@ fn portfolio_csv_indexes(headers: &StringRecord) -> PortfolioCsvIndexes {
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_portfolio_csv(
     state: State<'_, AppState>,
     path: String,
@@ -716,7 +728,7 @@ fn value_or_zero(value: &str) -> String {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_portfolio_csv_template(path: String) -> CommandResult<()> {
     if Path::new(&path)
         .extension()
@@ -809,7 +821,7 @@ fn ics_datetime(value: &str) -> CommandResult<(String, bool)> {
     Ok((fixed.to_rfc3339(), false))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_ics(
     state: State<'_, AppState>,
     path: String,
@@ -937,7 +949,7 @@ fn iso_to_ics(value: &str, all_day: bool) -> String {
         .unwrap_or_else(|_| value.into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_ics(state: State<'_, AppState>, path: String) -> CommandResult<usize> {
     if Path::new(&path)
         .extension()
@@ -1002,7 +1014,7 @@ fn render_ics(items: &[CalendarItem]) -> String {
     output
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_backup(
     state: State<'_, AppState>,
     path: String,
@@ -1011,7 +1023,7 @@ pub fn export_backup(
     backup::export_backup(&state, &PathBuf::from(path), &password)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn restore_backup(
     state: State<'_, AppState>,
     path: String,
@@ -1019,17 +1031,17 @@ pub fn restore_backup(
 ) -> CommandResult<BackupManifest> {
     backup::restore_backup(&state, &PathBuf::from(path), &password)
 }
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_backups(state: State<'_, AppState>) -> CommandResult<Vec<BackupInfo>> {
     backup::list_backups(&state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_backup(state: State<'_, AppState>, name: String) -> CommandResult<()> {
     backup::delete_backup(&state, &name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn restore_snapshot(state: State<'_, AppState>, name: String) -> CommandResult<i64> {
     backup::restore_snapshot(&state, &name)
 }
