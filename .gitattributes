@@ -1,0 +1,2 @@
+# Preserve verbatim upstream licence text, including evidence-hashed line endings.
+third-party/NOTICES.txt -text -whitespace

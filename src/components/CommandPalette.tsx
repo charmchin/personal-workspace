@@ -3,6 +3,7 @@ import { Command } from "cmdk";
 import { CalendarDays, CircleDollarSign, FileClock, LayoutDashboard, NotebookPen, Search, Settings, Sparkles, Sprout } from "lucide-react";
 import type { PageKey, SearchResult } from "../types";
 import { call } from "../lib/api";
+import { Modal } from "./ui";
 
 const pages: Array<{ id: PageKey; label: string; icon: typeof Search }> = [
   { id: "today", label: "打开：今日", icon: LayoutDashboard },
@@ -15,22 +16,24 @@ const pages: Array<{ id: PageKey; label: string; icon: typeof Search }> = [
   { id: "settings", label: "打开：设置", icon: Settings },
 ];
 
-const resultPage: Record<string, PageKey> = { task: "schedule", calendar: "schedule", project: "work", worklog: "work", goal: "growth", learning: "growth", content: "media", instrument: "portfolio" };
+const resultPage: Record<string, PageKey> = { task: "schedule", calendar: "schedule", project: "work", worklog: "work", goal: "growth", habit: "growth", learning: "growth", content: "media", instrument: "portfolio" };
 
-export function CommandPalette({ open, onClose, navigate, quickAdd }: { open: boolean; onClose: () => void; navigate: (page: PageKey) => void; quickAdd: () => void }) {
+export function CommandPalette({ open, onClose, navigate, quickAdd }: { open: boolean; onClose: () => void; navigate: (page: PageKey, result?: SearchResult) => void; quickAdd: () => void }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   useEffect(() => {
     if (!open) { setQuery(""); setResults([]); return; }
+    let active = true;
+    setResults([]);
     const handle = window.setTimeout(() => {
-      if (query.trim()) call<SearchResult[]>("search_records", { query }).then(setResults).catch(() => setResults([]));
+      if (query.trim()) call<SearchResult[]>("search_records", { query }).then((value) => { if (active) setResults(value); }).catch(() => { if (active) setResults([]); });
       else setResults([]);
     }, 160);
-    return () => window.clearTimeout(handle);
+    return () => { active = false; window.clearTimeout(handle); };
   }, [open, query]);
   if (!open) return null;
   return (
-    <div className="command-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <Modal open={open} onClose={onClose} title="全局搜索与命令" size="lg">
       <Command className="command-panel" label="全局命令">
         <div className="command-input"><Search size={18} /><Command.Input autoFocus value={query} onValueChange={setQuery} placeholder="搜索任务、项目、内容或证券…" /></div>
         <Command.List>
@@ -39,9 +42,9 @@ export function CommandPalette({ open, onClose, navigate, quickAdd }: { open: bo
           <Command.Group heading="页面">
             {pages.map((page) => { const Icon = page.icon; return <Command.Item key={page.id} value={page.label} onSelect={() => { navigate(page.id); onClose(); }}><Icon size={16} />{page.label}</Command.Item>; })}
           </Command.Group>
-          {results.length > 0 && <Command.Group heading="搜索结果">{results.map((result) => <Command.Item key={`${result.kind}-${result.id}`} value={`${result.title} ${result.subtitle}`} onSelect={() => { navigate(resultPage[result.kind] ?? "today"); onClose(); }}><span className="result-kind">{result.kind.slice(0, 1).toUpperCase()}</span><div><strong>{result.title}</strong><small>{result.subtitle}</small></div></Command.Item>)}</Command.Group>}
+          {results.length > 0 && <Command.Group heading="搜索结果">{results.map((result) => <Command.Item key={`${result.kind}-${result.id}`} value={`${result.kind} ${result.id} ${result.title} ${result.subtitle}`} keywords={[result.title, result.subtitle]} onSelect={() => { navigate(resultPage[result.kind] ?? "today", result); onClose(); }}><span className="result-kind">{result.kind.slice(0, 1).toUpperCase()}</span><div><strong>{result.title}</strong><small>{result.subtitle}</small></div></Command.Item>)}</Command.Group>}
         </Command.List>
       </Command>
-    </div>
+    </Modal>
   );
 }

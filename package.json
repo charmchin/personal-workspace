@@ -1,13 +1,21 @@
 {
   "name": "personal-workbench",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.5",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "app:build": "node scripts/build-app.mjs",
+    "app:privacy": "node scripts/scan-app-privacy.mjs",
+    "app:privacy:test": "node --test scripts/build-privacy.node-test.mjs",
+    "test": "vitest run --exclude '.local-docs/**'",
+    "test:watch": "vitest --exclude '.local-docs/**'",
+    "notices:update": "node scripts/third-party-notices.mjs",
+    "notices:check": "node scripts/third-party-notices.mjs --check",
+    "notices:verify": "node scripts/third-party-notices.mjs --verify",
+    "notices:test": "node --test scripts/third-party-notices.node-test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -32,7 +40,7 @@
     "jsdom": "^26.1.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
-    "vitest": "^3.2.4",
+    "vitest": "^4.1.11",
     "@tauri-apps/cli": "^2"
   }
 }

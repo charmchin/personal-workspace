@@ -83,6 +83,7 @@ export interface Project {
 
 export interface WorkLog {
   id: string;
+  taskId?: string | null;
   logDate: string;
   projectId?: string | null;
   title: string;
@@ -219,6 +220,8 @@ export interface Holding {
 }
 
 export interface PortfolioSnapshot {
+  valuationComplete?: boolean;
+  missingPriceCount?: number;
   totalMarketValue: string;
   totalCost: string;
   unrealizedGain: string;
@@ -240,8 +243,11 @@ export interface ReviewSnapshot {
 }
 
 export interface Dashboard {
+  portfolioError?: string | null;
   date: string;
   tasks: Task[];
+  pendingTaskCount?: number;
+  completedTaskCount?: number;
   nextEvent?: CalendarItem | null;
   habits: Habit[];
   workLogs: WorkLog[];
@@ -276,6 +282,8 @@ export interface BackupManifest {
   createdAt: string;
   appVersion: string;
   recordCount: number;
+  schemaVersion?: number;
+  tableRecordCounts?: Record<string, number>;
 }
 
 export interface BackupInfo {

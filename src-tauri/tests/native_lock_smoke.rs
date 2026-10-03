@@ -1,13 +1,27 @@
 //! Main-thread native smoke test. No real lock/sleep signals or user data are used.
 #![allow(dead_code)]
+#[path = "../src/backup.rs"]
+mod backup;
+#[allow(unused_imports)] // Harness-free executable does not run this module's unit tests.
+#[path = "../src/cancellation.rs"]
+mod cancellation;
 #[path = "../src/database.rs"]
 mod database;
+#[allow(unused_imports)] // Harness-free executable does not run module unit tests.
 #[path = "../src/error.rs"]
 mod error;
+#[allow(unused_imports)] // Harness-free executable does not run module unit tests.
+#[path = "../src/instance.rs"]
+mod instance;
 #[path = "../src/models.rs"]
 mod models;
 #[path = "../src/native_lock.rs"]
 mod native_lock;
+#[path = "../src/quotes.rs"]
+mod quotes;
+#[allow(unused_imports)] // Harness-free executable does not run this module's unit tests.
+#[path = "../src/repository.rs"]
+mod repository;
 #[path = "../src/restore.rs"]
 mod restore;
 #[allow(unused_imports)] // The harness-free executable does not run this module's unit tests.
@@ -32,6 +46,9 @@ fn main() {
         assert_eq!(subscriptions.len(), 8);
         let policy = Arc::new(SessionPolicy::new());
         policy.activate(0, 0).unwrap();
+        let cancellation = policy
+            .cancellation(policy.require_active().unwrap())
+            .unwrap();
         let name = NSString::from_str(&format!(
             "com.local.personalworkbench.test.{}",
             std::process::id()
@@ -45,13 +62,21 @@ fn main() {
             local.postNotificationName_object(&name, None);
         }
         assert!(!policy.snapshot().unlocked);
+        assert!(
+            cancellation.is_cancelled(),
+            "native callback must cancel in-flight session IO"
+        );
         drop(observer);
         policy.system_event(SystemEvent::ScreenUnlocked);
         policy.activate(policy.challenge().unwrap(), 0).unwrap();
+        let cancellation = policy
+            .cancellation(policy.require_active().unwrap())
+            .unwrap();
         unsafe {
             local.postNotificationName_object(&name, None);
         }
         assert!(policy.snapshot().unlocked, "observer must be removed");
+        assert!(!cancellation.is_cancelled());
 
         let distributed = NSDistributedNotificationCenter::defaultCenter();
         let callback = policy.clone();
@@ -70,10 +95,14 @@ fn main() {
             !policy.snapshot().unlocked,
             "distributed callback was not delivered"
         );
+        assert!(
+            cancellation.is_cancelled(),
+            "distributed callback must cancel session IO"
+        );
         drop(observer);
         drop(subscriptions);
         println!(
-            "native_lock_smoke: 8 subscriptions, local/distributed callbacks, authorization revocation and observer cleanup passed; no real system lock triggered"
+            "native_lock_smoke: 8 subscriptions, local/distributed callbacks, authorization revocation, IO cancellation and observer cleanup passed; no real system lock triggered"
         );
     });
 }

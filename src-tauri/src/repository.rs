@@ -1,8 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, Local, Months, NaiveDate, NaiveDateTime, TimeZone,
-    Utc,
+    DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, NaiveDateTime, TimeZone, Utc,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use rust_decimal::Decimal;
@@ -104,9 +103,33 @@ fn validate_optional_datetime(value: Option<&str>, field: &str) -> CommandResult
     Ok(())
 }
 
+pub(crate) fn utc_datetime(value: &str, field: &str) -> CommandResult<String> {
+    Ok(parse_datetime(value, field)?
+        .and_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
 fn parse_decimal(value: &str, field: &str) -> CommandResult<Decimal> {
-    Decimal::from_str(value.trim())
-        .map_err(|_| CommandError::new("INVALID_DECIMAL", format!("{field}必须是有效的十进制数字")))
+    if value.len() > 128 {
+        return Err(
+            CommandError::new("INVALID_DECIMAL", format!("{field}超过数字输入长度限制"))
+                .with_recovery("请使用不超过 128 字节的十进制数字，不要提交超长数字文本。"),
+        );
+    }
+    Decimal::from_str_exact(value.trim()).map_err(|_| {
+        CommandError::new(
+            "INVALID_DECIMAL",
+            format!("{field}不是可精确表示的十进制数字"),
+        )
+        .with_recovery("请检查数字格式、大小和小数位数；最多支持 28 位小数，数值须在本地十进制类型的可表示范围内。")
+    })
+}
+
+fn checked_financial(value: Option<Decimal>, field: &str) -> CommandResult<Decimal> {
+    value.ok_or_else(|| {
+        CommandError::new("FINANCIAL_OVERFLOW", format!("{field}超出可计算范围"))
+            .with_recovery("请检查交易数量、金额、费用与价格；本次写入未保存。若读取已有数据时报错，请修正相关记录，不要重复导入。")
+    })
 }
 
 fn decimal_string(value: Decimal) -> String {
@@ -137,7 +160,7 @@ const TASK_FIELDS: &str = "id, title, notes, status, priority, due_date, schedul
 
 pub fn list_tasks(connection: &Connection) -> CommandResult<Vec<Task>> {
     let sql = format!(
-        "SELECT {TASK_FIELDS} FROM tasks ORDER BY CASE status WHEN 'todo' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END, priority ASC, COALESCE(due_date, '9999-12-31'), created_at DESC"
+        "SELECT {TASK_FIELDS} FROM tasks ORDER BY CASE status WHEN 'done' THEN 1 ELSE 0 END, priority ASC, COALESCE(due_date, '9999-12-31'), CASE status WHEN 'doing' THEN 0 ELSE 1 END, created_at DESC"
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map([], map_task)?;
@@ -169,6 +192,18 @@ pub fn upsert_task(connection: &Connection, mut task: Task) -> CommandResult<Tas
     validate_optional_date(task.due_date.as_deref(), "截止日期")?;
     validate_optional_datetime(task.scheduled_start.as_deref(), "计划开始时间")?;
     validate_optional_datetime(task.scheduled_end.as_deref(), "计划结束时间")?;
+    task.scheduled_start = task
+        .scheduled_start
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| utc_datetime(value, "计划开始时间"))
+        .transpose()?;
+    task.scheduled_end = task
+        .scheduled_end
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| utc_datetime(value, "计划结束时间"))
+        .transpose()?;
     if let (Some(start), Some(end)) = (&task.scheduled_start, &task.scheduled_end)
         && parse_datetime(end, "计划结束时间")? < parse_datetime(start, "计划开始时间")?
     {
@@ -219,7 +254,11 @@ pub fn toggle_task(connection: &Connection, id: &str, completed: bool) -> Comman
             completed_occurrence.completed_at = Some(now);
             completed_occurrence.created_at.clear();
             completed_occurrence.updated_at.clear();
-            upsert_task(&transaction, completed_occurrence)?;
+            let archived = upsert_task(&transaction, completed_occurrence)?;
+            transaction.execute(
+                "UPDATE work_logs SET task_id=?1 WHERE task_id=?2",
+                params![archived.id, id],
+            )?;
 
             let days = (next_date - base_date).num_days();
             let mut next_occurrence = task;
@@ -321,6 +360,18 @@ pub fn upsert_calendar(
     item.title = require_text(&item.title, "日程标题")?;
     let start = parse_datetime(&item.start_at, "日程开始时间")?;
     let end = parse_datetime(&item.end_at, "日程结束时间")?;
+    if item.all_day {
+        let start_day = parse_date(item.start_at.get(..10).unwrap_or_default(), "全天开始日期")?;
+        let mut end_day = parse_date(item.end_at.get(..10).unwrap_or_default(), "全天结束日期")?;
+        if end_day == start_day {
+            end_day += Duration::days(1);
+        }
+        item.start_at = format!("{start_day}T00:00:00+08:00");
+        item.end_at = format!("{end_day}T00:00:00+08:00");
+    } else {
+        item.start_at = utc_datetime(&item.start_at, "日程开始时间")?;
+        item.end_at = utc_datetime(&item.end_at, "日程结束时间")?;
+    }
     if end < start {
         return Err(CommandError::new(
             "VALIDATION_ERROR",
@@ -417,11 +468,12 @@ fn map_work_log(row: &Row<'_>) -> rusqlite::Result<WorkLog> {
         attachment_path: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        task_id: row.get(13)?,
     })
 }
 
 pub fn list_work_logs(connection: &Connection) -> CommandResult<Vec<WorkLog>> {
-    let mut statement = connection.prepare("SELECT id, log_date, project_id, title, completed, blockers, next_steps, minutes, energy, markdown, attachment_path, created_at, updated_at FROM work_logs ORDER BY log_date DESC, created_at DESC")?;
+    let mut statement = connection.prepare("SELECT id, log_date, project_id, title, completed, blockers, next_steps, minutes, energy, markdown, attachment_path, created_at, updated_at, task_id FROM work_logs ORDER BY log_date DESC, created_at DESC")?;
     let rows = statement.query_map([], map_work_log)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
@@ -445,12 +497,46 @@ pub fn upsert_work_log(connection: &Connection, mut log: WorkLog) -> CommandResu
         log.created_at.clone()
     };
     connection.execute(
-        r#"INSERT INTO work_logs(id,log_date,project_id,title,completed,blockers,next_steps,minutes,energy,markdown,attachment_path,created_at,updated_at)
-           VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-           ON CONFLICT(id) DO UPDATE SET log_date=excluded.log_date, project_id=excluded.project_id, title=excluded.title, completed=excluded.completed, blockers=excluded.blockers, next_steps=excluded.next_steps, minutes=excluded.minutes, energy=excluded.energy, markdown=excluded.markdown, attachment_path=excluded.attachment_path, updated_at=excluded.updated_at"#,
-        params![log.id, log.log_date, log.project_id, log.title, log.completed, log.blockers, log.next_steps, log.minutes, log.energy, log.markdown, log.attachment_path, created_at, now],
+        r#"INSERT INTO work_logs(id,log_date,project_id,title,completed,blockers,next_steps,minutes,energy,markdown,attachment_path,created_at,updated_at,task_id)
+           VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+           ON CONFLICT(id) DO UPDATE SET log_date=excluded.log_date, project_id=excluded.project_id, title=excluded.title, completed=excluded.completed, blockers=excluded.blockers, next_steps=excluded.next_steps, minutes=excluded.minutes, energy=excluded.energy, markdown=excluded.markdown, attachment_path=excluded.attachment_path, task_id=excluded.task_id, updated_at=excluded.updated_at"#,
+        params![log.id, log.log_date, log.project_id, log.title, log.completed, log.blockers, log.next_steps, log.minutes, log.energy, log.markdown, log.attachment_path, created_at, now,log.task_id],
     )?;
-    connection.query_row("SELECT id, log_date, project_id, title, completed, blockers, next_steps, minutes, energy, markdown, attachment_path, created_at, updated_at FROM work_logs WHERE id=?1", [&log.id], map_work_log).map_err(Into::into)
+    connection.query_row("SELECT id, log_date, project_id, title, completed, blockers, next_steps, minutes, energy, markdown, attachment_path, created_at, updated_at, task_id FROM work_logs WHERE id=?1", [&log.id], map_work_log).map_err(Into::into)
+}
+
+pub fn create_task_from_work_log(
+    connection: &Connection,
+    log_id: &str,
+    task: Task,
+) -> CommandResult<Task> {
+    let transaction = connection.unchecked_transaction()?;
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT task_id FROM work_logs WHERE id=?1",
+            [log_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| CommandError::new("NOT_FOUND", "工作记录已不存在"))?;
+    let saved = if let Some(id) = existing {
+        get_task(&transaction, &id)?
+    } else {
+        if !task.id.is_empty() {
+            return Err(CommandError::new(
+                "VALIDATION_ERROR",
+                "从工作记录创建任务必须使用新任务",
+            ));
+        }
+        let saved = upsert_task(&transaction, task)?;
+        transaction.execute(
+            "UPDATE work_logs SET task_id=?1,updated_at=?2 WHERE id=?3",
+            params![saved.id, now_utc(), log_id],
+        )?;
+        saved
+    };
+    transaction.commit()?;
+    Ok(saved)
 }
 
 fn map_goal(row: &Row<'_>) -> rusqlite::Result<Goal> {
@@ -582,10 +668,16 @@ pub fn upsert_habit(connection: &Connection, mut habit: Habit) -> CommandResult<
            ON CONFLICT(id) DO UPDATE SET name=excluded.name,frequency=excluded.frequency,target_per_week=excluded.target_per_week,color=excluded.color,active=excluded.active,updated_at=excluded.updated_at"#,
         params![habit.id,habit.name,habit.frequency,habit.target_per_week,habit.color,habit.active as i64,created_at,now],
     )?;
-    list_habits(connection, &Local::now().format("%Y-%m-%d").to_string())?
-        .into_iter()
-        .find(|item| item.id == habit.id)
-        .ok_or_else(|| CommandError::new("NOT_FOUND", "未找到已保存的习惯"))
+    list_habits(
+        connection,
+        &Utc::now()
+            .with_timezone(&FixedOffset::east_opt(8 * 3600).expect("fixed offset"))
+            .format("%Y-%m-%d")
+            .to_string(),
+    )?
+    .into_iter()
+    .find(|item| item.id == habit.id)
+    .ok_or_else(|| CommandError::new("NOT_FOUND", "未找到已保存的习惯"))
 }
 
 pub fn check_habit(
@@ -716,6 +808,12 @@ pub fn upsert_content(
         return Err(CommandError::new("VALIDATION_ERROR", "内容状态无效"));
     }
     validate_optional_datetime(item.publish_at.as_deref(), "发布时间")?;
+    item.publish_at = item
+        .publish_at
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| utc_datetime(value, "发布时间"))
+        .transpose()?;
     item.platform = require_text(&item.platform, "发布平台")?;
     item.format = require_text(&item.format, "内容形式")?;
     validate_text_length(&item.goal, "内容目标", 100_000)?;
@@ -849,13 +947,40 @@ pub fn upsert_instrument(
         }
     }
     let now = now_utc();
+    let old_price: Option<Option<String>> = connection
+        .query_row(
+            "SELECT manual_price FROM instruments WHERE id=?1",
+            [&item.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let changed_price = old_price
+        .as_ref()
+        .is_none_or(|old| old != &item.manual_price);
     let created = if item.created_at.is_empty() {
         now.clone()
     } else {
         item.created_at.clone()
     };
-    connection.execute(r#"INSERT INTO instruments(id,code,name,kind,market,currency,manual_price,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)ON CONFLICT(id)DO UPDATE SET code=excluded.code,name=excluded.name,kind=excluded.kind,market=excluded.market,currency=excluded.currency,manual_price=excluded.manual_price,updated_at=excluded.updated_at"#,params![item.id,item.code,item.name,item.kind,item.market,item.currency,item.manual_price,created,now])?;
-    connection.query_row("SELECT id,code,name,kind,market,currency,manual_price,created_at,updated_at FROM instruments WHERE id=?1",[&item.id],map_instrument).map_err(Into::into)
+    with_portfolio_savepoint(connection, || {
+        connection.execute(r#"INSERT INTO instruments(id,code,name,kind,market,currency,manual_price,created_at,updated_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)ON CONFLICT(id)DO UPDATE SET code=excluded.code,name=excluded.name,kind=excluded.kind,market=excluded.market,currency=excluded.currency,manual_price=excluded.manual_price,updated_at=excluded.updated_at"#,params![item.id,item.code,item.name,item.kind,item.market,item.currency,item.manual_price,created,now])?;
+        if changed_price && let Some(price) = &item.manual_price {
+            upsert_price(
+                connection,
+                PricePointInput {
+                    instrument_id: item.id.clone(),
+                    price_date: Utc::now()
+                        .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+                        .format("%Y-%m-%d")
+                        .to_string(),
+                    price: price.clone(),
+                    source: "manual".into(),
+                },
+            )?;
+        }
+        portfolio_snapshot(connection)?;
+        connection.query_row("SELECT id,code,name,kind,market,currency,manual_price,created_at,updated_at FROM instruments WHERE id=?1",[&item.id],map_instrument).map_err(Into::into)
+    })
 }
 
 fn map_transaction(row: &Row<'_>) -> rusqlite::Result<PortfolioTransaction> {
@@ -885,6 +1010,26 @@ pub fn upsert_transaction(
     mut item: PortfolioTransaction,
 ) -> CommandResult<PortfolioTransaction> {
     item.id = identifier(&item.id);
+    validate_transaction_fields(&item)?;
+    let now = now_utc();
+    let created = if item.created_at.is_empty() {
+        now.clone()
+    } else {
+        item.created_at.clone()
+    };
+    if connection.is_autocommit() {
+        let transaction = connection.unchecked_transaction()?;
+        let saved = persist_transaction(&transaction, &item, &created, &now)?;
+        transaction.commit()?;
+        Ok(saved)
+    } else {
+        with_portfolio_savepoint(connection, || {
+            persist_transaction(connection, &item, &created, &now)
+        })
+    }
+}
+
+fn validate_transaction_fields(item: &PortfolioTransaction) -> CommandResult<()> {
     if !matches!(
         item.kind.as_str(),
         "buy" | "sell" | "subscribe" | "redeem" | "dividend" | "fee" | "tax" | "adjustment"
@@ -906,27 +1051,122 @@ pub fn upsert_transaction(
         ("税费", &item.tax),
     ] {
         let parsed = parse_decimal(value, name)?;
-        if parsed < Decimal::ZERO {
+        if parsed < Decimal::ZERO && !(item.kind == "adjustment" && matches!(name, "数量" | "金额"))
+        {
             return Err(CommandError::new(
                 "VALIDATION_ERROR",
                 format!("{name}不能为负数"),
             ));
         }
     }
+    if matches!(item.kind.as_str(), "buy" | "sell" | "subscribe" | "redeem")
+        && parse_decimal(&item.quantity, "数量")? <= Decimal::ZERO
+    {
+        return Err(CommandError::new(
+            "INVALID_TRANSACTION_QUANTITY",
+            "买卖与申赎必须有大于零的份额",
+        ));
+    }
+    if item.kind == "adjustment"
+        && (!parse_decimal(&item.fee, "手续费")?.is_zero()
+            || !parse_decimal(&item.tax, "税费")?.is_zero())
+    {
+        return Err(CommandError::new(
+            "INVALID_ADJUSTMENT",
+            "资金或份额调整不包含费用，请另记费用或税费",
+        ));
+    }
     validate_text_length(&item.notes, "交易备注", 100_000)?;
-    let now = now_utc();
-    let created = if item.created_at.is_empty() {
-        now.clone()
-    } else {
-        item.created_at.clone()
-    };
-    if connection.is_autocommit() {
-        let transaction = connection.unchecked_transaction()?;
-        let saved = persist_transaction(&transaction, &item, &created, &now)?;
-        transaction.commit()?;
-        Ok(saved)
-    } else {
-        persist_transaction(connection, &item, &created, &now)
+    Ok(())
+}
+
+pub(crate) fn validate_portfolio_for_backup(connection: &Connection) -> CommandResult<()> {
+    for item in list_transactions(connection)? {
+        validate_transaction_fields(&item)?;
+    }
+    for item in list_instruments(connection)? {
+        if let Some(value) = item.manual_price
+            && parse_decimal(&value, "手工价格")? < Decimal::ZERO
+        {
+            return Err(CommandError::new("VALIDATION_ERROR", "手工价格不能为负数"));
+        }
+    }
+    let mut statement = connection.prepare("SELECT price_date,price,source FROM price_points")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        parse_date(&row.get::<_, String>(0)?, "价格日期")?;
+        if parse_decimal(&row.get::<_, String>(1)?, "价格")? < Decimal::ZERO {
+            return Err(CommandError::new("VALIDATION_ERROR", "价格不能为负数"));
+        }
+        require_choice(
+            &row.get::<_, String>(2)?,
+            "价格来源",
+            &["manual", "tushare"],
+        )?;
+    }
+    portfolio_snapshot(connection)?;
+    Ok(())
+}
+
+// Public repository callers use &Connection, including callers that already
+// own a transaction/savepoint. A private, uniquely named savepoint protects
+// this operation without committing or rolling back a successful outer one.
+struct PortfolioSavepoint<'a> {
+    connection: &'a Connection,
+    name: String,
+    active: bool,
+}
+
+impl<'a> PortfolioSavepoint<'a> {
+    fn new(connection: &'a Connection) -> CommandResult<Self> {
+        let name = format!("workbench_portfolio_{}", Uuid::now_v7().simple());
+        connection.execute_batch(&format!("SAVEPOINT {name}"))?;
+        Ok(Self {
+            connection,
+            name,
+            active: true,
+        })
+    }
+
+    fn commit(&mut self) -> CommandResult<()> {
+        self.connection
+            .execute_batch(&format!("RELEASE {}", self.name))?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> CommandResult<()> {
+        self.connection
+            .execute_batch(&format!("ROLLBACK TO {}; RELEASE {}", self.name, self.name))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for PortfolioSavepoint<'_> {
+    fn drop(&mut self) {
+        if self.active && self.rollback().is_err() {
+            // Fail closed if savepoint cleanup fails: never allow a caller to
+            // accidentally commit the rejected mutation in its outer scope.
+            let _ = self.connection.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+fn with_portfolio_savepoint<T>(
+    connection: &Connection,
+    operation: impl FnOnce() -> CommandResult<T>,
+) -> CommandResult<T> {
+    let mut savepoint = PortfolioSavepoint::new(connection)?;
+    match operation() {
+        Ok(value) => {
+            savepoint.commit()?;
+            Ok(value)
+        }
+        Err(error) => {
+            savepoint.rollback()?;
+            Err(error)
+        }
     }
 }
 
@@ -949,8 +1189,21 @@ pub fn upsert_price(connection: &Connection, input: PricePointInput) -> CommandR
     if price < Decimal::ZERO {
         return Err(CommandError::new("VALIDATION_ERROR", "价格不能为负数"));
     }
-    connection.execute(r#"INSERT INTO price_points(id,instrument_id,price_date,price,source,created_at)VALUES(?1,?2,?3,?4,?5,?6)ON CONFLICT(instrument_id,price_date,source)DO UPDATE SET price=excluded.price,created_at=excluded.created_at"#,params![Uuid::now_v7().to_string(),input.instrument_id,input.price_date,decimal_string(price),input.source,now_utc()])?;
-    Ok(())
+    with_portfolio_savepoint(connection, || {
+        connection.execute(r#"INSERT INTO price_points(id,instrument_id,price_date,price,source,created_at)VALUES(?1,?2,?3,?4,?5,?6)ON CONFLICT(instrument_id,price_date,source)DO UPDATE SET price=excluded.price,created_at=excluded.created_at"#,params![Uuid::now_v7().to_string(),input.instrument_id,input.price_date,decimal_string(price),input.source,now_utc()])?;
+        let snapshot = portfolio_snapshot(connection)?;
+        for holding in snapshot
+            .holdings
+            .iter()
+            .filter(|holding| holding.instrument_id == input.instrument_id)
+        {
+            checked_financial(
+                parse_decimal(&holding.quantity, "持仓数量")?.checked_mul(price),
+                "价格对应的持仓市值",
+            )?;
+        }
+        Ok(())
+    })
 }
 
 #[derive(Default)]
@@ -969,6 +1222,7 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
         a.trade_date
             .cmp(&b.trade_date)
             .then(a.created_at.cmp(&b.created_at))
+            .then(a.id.cmp(&b.id))
     });
     for tx in ordered {
         let quantity = parse_decimal(&tx.quantity, "数量")?;
@@ -983,14 +1237,20 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
             .entry((tx.account_id.clone(), tx.instrument_id.clone()))
             .or_default();
         let amount = if explicit_amount.is_zero() {
-            quantity * unit_price
+            checked_financial(quantity.checked_mul(unit_price), "交易金额")?
         } else {
             explicit_amount
         };
         match tx.kind.as_str() {
             "buy" | "subscribe" => {
-                state.quantity += quantity;
-                state.total_cost += amount + fee + tax;
+                state.quantity =
+                    checked_financial(state.quantity.checked_add(quantity), "累计持仓")?;
+                let cost = checked_financial(
+                    amount.checked_add(fee).and_then(|sum| sum.checked_add(tax)),
+                    "含费用的交易成本",
+                )?;
+                state.total_cost =
+                    checked_financial(state.total_cost.checked_add(cost), "累计持仓成本")?;
             }
             "sell" | "redeem" => {
                 if quantity > state.quantity {
@@ -1004,29 +1264,68 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
                 let average = if state.quantity.is_zero() {
                     Decimal::ZERO
                 } else {
-                    state.total_cost / state.quantity
+                    checked_financial(state.total_cost.checked_div(state.quantity), "平均成本")?
                 };
-                let allocated = average * sell_qty;
-                state.quantity -= sell_qty;
-                state.total_cost -= allocated;
-                state.realized += amount - fee - tax - allocated;
+                let allocated = if sell_qty == state.quantity {
+                    state.total_cost
+                } else {
+                    checked_financial(average.checked_mul(sell_qty), "卖出成本分摊")?
+                };
+                state.quantity =
+                    checked_financial(state.quantity.checked_sub(sell_qty), "卖出后持仓")?;
+                state.total_cost =
+                    checked_financial(state.total_cost.checked_sub(allocated), "卖出后成本")?;
+                let gain = checked_financial(
+                    amount
+                        .checked_sub(fee)
+                        .and_then(|net| net.checked_sub(tax))
+                        .and_then(|net| net.checked_sub(allocated)),
+                    "卖出收益",
+                )?;
+                state.realized =
+                    checked_financial(state.realized.checked_add(gain), "累计已实现收益")?;
                 if state.quantity.is_zero() {
                     state.total_cost = Decimal::ZERO;
                 }
             }
-            "dividend" => state.realized += amount,
-            "fee" | "tax" => state.realized -= amount + fee + tax,
+            "dividend" => {
+                let net = checked_financial(
+                    amount
+                        .checked_sub(fee)
+                        .and_then(|value| value.checked_sub(tax)),
+                    "分红净收益",
+                )?;
+                state.realized = checked_financial(state.realized.checked_add(net), "累计分红收益")?
+            }
+            "fee" | "tax" => {
+                let expense = checked_financial(
+                    amount.checked_add(fee).and_then(|sum| sum.checked_add(tax)),
+                    "费用合计",
+                )?;
+                state.realized =
+                    checked_financial(state.realized.checked_sub(expense), "扣费后已实现收益")?;
+            }
             "adjustment" => {
                 if is_cash {
                     let cash_amount = if amount.is_zero() { quantity } else { amount };
-                    state.quantity += cash_amount;
-                    state.total_cost += cash_amount;
+                    state.quantity =
+                        checked_financial(state.quantity.checked_add(cash_amount), "现金余额")?;
+                    state.total_cost =
+                        checked_financial(state.total_cost.checked_add(cash_amount), "现金成本")?;
                 } else {
-                    state.quantity += quantity;
-                    state.total_cost += amount;
+                    state.quantity =
+                        checked_financial(state.quantity.checked_add(quantity), "调整后持仓")?;
+                    state.total_cost =
+                        checked_financial(state.total_cost.checked_add(amount), "调整后成本")?;
                 }
             }
             _ => {}
+        }
+        if state.quantity < Decimal::ZERO || state.total_cost < Decimal::ZERO {
+            return Err(CommandError::new(
+                "INVALID_POSITION_ADJUSTMENT",
+                "资金或份额调整会造成负余额或负成本",
+            ));
         }
     }
     let mut holdings = vec![];
@@ -1034,6 +1333,8 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
     let mut total_cost = Decimal::ZERO;
     let mut total_realized = Decimal::ZERO;
     let mut latest_update: Option<String> = None;
+    let mut missing_price_count = 0;
+    let mut total_unrealized = Decimal::ZERO;
     for ((account_id, instrument_id), state) in states {
         if state.quantity.is_zero() && state.realized.is_zero() {
             continue;
@@ -1041,7 +1342,15 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
         let Some(instrument) = instruments.iter().find(|item| item.id == instrument_id) else {
             continue;
         };
-        let latest:Option<(String,String,String)>=connection.query_row("SELECT price,price_date,source FROM price_points WHERE instrument_id=?1 ORDER BY price_date DESC,created_at DESC LIMIT 1",[&instrument_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+        if let Some(value) = &instrument.manual_price {
+            checked_financial(
+                state
+                    .quantity
+                    .checked_mul(parse_decimal(value, "手工价格")?),
+                "手工价格对应的市值",
+            )?;
+        }
+        let latest:Option<(String,String,String)>=connection.query_row("SELECT price,price_date,source FROM price_points WHERE instrument_id=?1 ORDER BY price_date DESC,CASE source WHEN 'manual' THEN 0 ELSE 1 END,created_at DESC,id DESC LIMIT 1",[&instrument_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
         let (price, price_date, source) = if let Some((value, date, source)) = latest {
             (parse_decimal(&value, "行情价格")?, Some(date), source)
         } else if let Some(value) = &instrument.manual_price {
@@ -1056,16 +1365,27 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
         {
             latest_update = Some(date.clone());
         }
-        let market = state.quantity * price;
-        let unrealized = market - state.total_cost;
+        let market = checked_financial(state.quantity.checked_mul(price), "持仓市值")?;
+        let unavailable = source == "missing" && !state.quantity.is_zero();
+        if unavailable {
+            missing_price_count += 1;
+        }
+        let unrealized = if unavailable {
+            Decimal::ZERO
+        } else {
+            checked_financial(market.checked_sub(state.total_cost), "未实现收益")?
+        };
+        total_unrealized =
+            checked_financial(total_unrealized.checked_add(unrealized), "组合未实现收益")?;
         let average = if state.quantity.is_zero() {
             Decimal::ZERO
         } else {
-            state.total_cost / state.quantity
+            checked_financial(state.total_cost.checked_div(state.quantity), "持仓平均成本")?
         };
-        total_market += market;
-        total_cost += state.total_cost;
-        total_realized += state.realized;
+        total_market = checked_financial(total_market.checked_add(market), "组合市值")?;
+        total_cost = checked_financial(total_cost.checked_add(state.total_cost), "组合成本")?;
+        total_realized =
+            checked_financial(total_realized.checked_add(state.realized), "组合已实现收益")?;
         holdings.push(Holding {
             account_id,
             instrument_id,
@@ -1089,10 +1409,12 @@ pub fn portfolio_snapshot(connection: &Connection) -> CommandResult<PortfolioSna
     Ok(PortfolioSnapshot {
         total_market_value: decimal_string(total_market),
         total_cost: decimal_string(total_cost),
-        unrealized_gain: decimal_string(total_market - total_cost),
+        unrealized_gain: decimal_string(total_unrealized),
         realized_gain: decimal_string(total_realized),
         holdings,
         updated_at: latest_update,
+        valuation_complete: missing_price_count == 0,
+        missing_price_count,
     })
 }
 
@@ -1162,11 +1484,33 @@ pub fn delete_record(connection: &Connection, kind: &str, id: &str) -> CommandRe
             ));
         }
     };
-    let affected = connection.execute(&format!("DELETE FROM {table} WHERE id=?1"), [id])?;
-    if affected == 0 {
-        return Err(CommandError::new("NOT_FOUND", "未找到要删除的记录"));
+    let remove = || {
+        let affected = connection.execute(&format!("DELETE FROM {table} WHERE id=?1"), [id])?;
+        if affected == 0 {
+            return Err(CommandError::new("NOT_FOUND", "未找到要删除的记录"));
+        }
+        if kind == "transaction" {
+            portfolio_snapshot(connection).map_err(|error| {
+                if error.code == "INSUFFICIENT_POSITION" {
+                    CommandError::new(
+                        "INSUFFICIENT_POSITION",
+                        "不能删除这笔交易：删除后，后续卖出或赎回将超过当时持仓。",
+                    )
+                    .with_recovery(
+                        "本次删除已取消；请先检查或调整依赖这笔买入/申购的后续交易，再重试。",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        }
+        Ok(())
+    };
+    if kind == "transaction" {
+        with_portfolio_savepoint(connection, remove)
+    } else {
+        remove()
     }
-    Ok(())
 }
 
 pub fn settings(connection: &Connection) -> CommandResult<AppSettings> {
@@ -1178,10 +1522,7 @@ pub fn update_settings(connection: &Connection, value: AppSettings) -> CommandRe
 }
 
 fn shanghai_calendar_date(timestamp: &str) -> Option<String> {
-    let offset = FixedOffset::east_opt(8 * 60 * 60)?;
-    DateTime::parse_from_rfc3339(timestamp)
-        .ok()
-        .map(|value| value.with_timezone(&offset).format("%Y-%m-%d").to_string())
+    shanghai_datetime(timestamp).map(|value| value.format("%Y-%m-%d").to_string())
 }
 
 fn shanghai_datetime(timestamp: &str) -> Option<NaiveDateTime> {
@@ -1196,7 +1537,7 @@ fn shanghai_datetime(timestamp: &str) -> Option<NaiveDateTime> {
 pub fn dashboard(connection: &Connection, date: &str) -> CommandResult<Dashboard> {
     let today = parse_date(date, "首页日期")?;
     let all_tasks = list_tasks(connection)?;
-    let mut tasks = all_tasks
+    let pending = all_tasks
         .iter()
         .filter(|task| {
             task.status != "done"
@@ -1204,38 +1545,48 @@ pub fn dashboard(connection: &Connection, date: &str) -> CommandResult<Dashboard
                     || task
                         .scheduled_start
                         .as_deref()
-                        .is_some_and(|start| start.starts_with(date)))
+                        .and_then(shanghai_calendar_date)
+                        .is_some_and(|start| start == date))
         })
-        .take(5)
         .cloned()
         .collect::<Vec<_>>();
-    tasks.extend(
-        all_tasks
-            .into_iter()
-            .filter(|task| {
-                task.status == "done"
-                    && task
-                        .completed_at
-                        .as_deref()
-                        .and_then(shanghai_calendar_date)
-                        .is_some_and(|completed_date| completed_date == date)
-            })
-            .take(3),
-    );
+    let mut completed = all_tasks
+        .into_iter()
+        .filter(|task| {
+            task.status == "done"
+                && task
+                    .completed_at
+                    .as_deref()
+                    .and_then(shanghai_calendar_date)
+                    .is_some_and(|completed_date| completed_date == date)
+        })
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|task| {
+        std::cmp::Reverse(task.completed_at.as_deref().and_then(shanghai_datetime))
+    });
+    let pending_task_count = pending.len();
+    let completed_task_count = completed.len();
+    let tasks = pending
+        .into_iter()
+        .take(5)
+        .chain(completed.into_iter().take(3))
+        .collect();
     let shanghai_offset = FixedOffset::east_opt(8 * 60 * 60)
         .ok_or_else(|| CommandError::new("INVALID_TIMEZONE", "无法初始化上海时区"))?;
     let shanghai_now = Utc::now().with_timezone(&shanghai_offset).naive_local();
     let is_current_day = today == shanghai_now.date();
     let mut upcoming = list_calendar(connection, None, None)?
         .into_iter()
-        .filter_map(|item| next_calendar_occurrence(item, today))
+        .filter_map(|item| {
+            next_calendar_occurrence_after(item, today, is_current_day.then_some(shanghai_now))
+        })
         .filter(|item| {
             !is_current_day
                 || item.all_day
                 || shanghai_datetime(&item.end_at).is_none_or(|end| end >= shanghai_now)
         })
         .collect::<Vec<_>>();
-    upcoming.sort_by(|left, right| left.start_at.cmp(&right.start_at));
+    upcoming.sort_by_key(|item| shanghai_datetime(&item.start_at));
     let next_event = upcoming.into_iter().next();
     let habits = list_habits(connection, date)?;
     let work_logs = list_work_logs(connection)?
@@ -1248,14 +1599,24 @@ pub fn dashboard(connection: &Connection, date: &str) -> CommandResult<Dashboard
         .filter(|item| item.status != "archived" && item.status != "published")
         .take(5)
         .collect();
+    let (portfolio, portfolio_error) = match portfolio_snapshot(connection) {
+        Ok(value) => (value, None),
+        Err(error) => (
+            PortfolioSnapshot::default(),
+            Some(format!("投资摘要暂不可用：{}", error.message)),
+        ),
+    };
     Ok(Dashboard {
         date: date.into(),
         tasks,
+        pending_task_count,
+        completed_task_count,
         next_event,
         habits,
         work_logs,
         content_items,
-        portfolio: portfolio_snapshot(connection)?,
+        portfolio,
+        portfolio_error,
         settings: load_settings(connection)?,
     })
 }
@@ -1272,28 +1633,55 @@ fn recurrence_occurs(start: NaiveDate, target: NaiveDate, recurrence: &str) -> b
     }
 }
 
+#[cfg(test)]
 fn next_calendar_occurrence(item: CalendarItem, from: NaiveDate) -> Option<CalendarItem> {
-    let start_date = NaiveDate::parse_from_str(item.start_at.get(..10)?, "%Y-%m-%d").ok()?;
-    let end_date = NaiveDate::parse_from_str(item.end_at.get(..10)?, "%Y-%m-%d").ok()?;
-    let duration_days = (end_date - start_date).num_days().max(0);
+    next_calendar_occurrence_after(item, from, None)
+}
+
+fn next_calendar_occurrence_after(
+    item: CalendarItem,
+    from: NaiveDate,
+    after: Option<NaiveDateTime>,
+) -> Option<CalendarItem> {
+    let start_date = shanghai_datetime(&item.start_at)?.date();
+    let start = shanghai_datetime(&item.start_at)?;
+    let end = shanghai_datetime(&item.end_at)?;
+    let threshold = after.unwrap_or(from.and_hms_opt(0, 0, 0)?);
     if item.recurrence == "none" {
-        let end_date = item.end_at.get(..10).unwrap_or_default();
-        return (end_date >= from.format("%Y-%m-%d").to_string().as_str()).then_some(item);
+        return (end > threshold || (start == end && start >= threshold)).then_some(item);
     }
-    for offset in 0..=366 {
-        let target = from + Duration::days(offset);
+    // Monthly rules such as the 31st may skip a month, so allow 62 days.
+    // Check it for an ongoing overnight occurrence before seeking a future one.
+    let anchor = (0..=62)
+        .find_map(|back| {
+            let date = from - Duration::days(back);
+            recurrence_occurs(start_date, date, &item.recurrence).then_some(date)
+        })
+        .unwrap_or(start_date);
+    for offset in 0..=397 {
+        let target = anchor + Duration::days(offset);
         if recurrence_occurs(start_date, target, &item.recurrence) {
+            let next_start = target.and_time(start.time());
+            let next_end = next_start + (end - start);
+            if next_end <= threshold && !(next_end == next_start && next_start >= threshold) {
+                continue;
+            }
             let mut occurrence = item;
-            occurrence.start_at = format!(
-                "{}{}",
-                target.format("%Y-%m-%d"),
-                occurrence.start_at.get(10..).unwrap_or("")
-            );
-            occurrence.end_at = format!(
-                "{}{}",
-                (target + Duration::days(duration_days)).format("%Y-%m-%d"),
-                occurrence.end_at.get(10..).unwrap_or("")
-            );
+            if occurrence.all_day {
+                occurrence.start_at = format!("{}+08:00", next_start.format("%Y-%m-%dT%H:%M:%S"));
+                occurrence.end_at = format!("{}+08:00", next_end.format("%Y-%m-%dT%H:%M:%S"));
+            } else {
+                occurrence.start_at = utc_datetime(
+                    &next_start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "重复开始时间",
+                )
+                .ok()?;
+                occurrence.end_at = utc_datetime(
+                    &next_end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    "重复结束时间",
+                )
+                .ok()?;
+            }
             return Some(occurrence);
         }
     }
@@ -1311,10 +1699,17 @@ pub fn search(connection: &Connection, query: &str) -> CommandResult<Vec<SearchR
             "搜索关键词不能超过 240 个字符",
         ));
     }
-    let pattern = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
+    let pattern = format!(
+        "%{}%",
+        q.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
     let mut results = vec![];
     let specs = [
         ("task", "tasks", "title", "COALESCE(due_date,'无截止日期')"),
+        ("calendar", "calendar_items", "title", "start_at"),
+        ("habit", "habits", "name", "frequency"),
         ("project", "projects", "name", "area"),
         ("worklog", "work_logs", "title", "log_date"),
         ("goal", "goals", "title", "horizon"),
@@ -1323,8 +1718,13 @@ pub fn search(connection: &Connection, query: &str) -> CommandResult<Vec<SearchR
         ("instrument", "instruments", "name", "code"),
     ];
     for (kind, table, title, subtitle) in specs {
+        let predicate = if kind == "instrument" {
+            format!("({title} LIKE ?1 ESCAPE '\\' OR code LIKE ?1 ESCAPE '\\')")
+        } else {
+            format!("{title} LIKE ?1 ESCAPE '\\'")
+        };
         let sql = format!(
-            "SELECT id,{title},{subtitle} FROM {table} WHERE {title} LIKE ?1 ESCAPE '\\' ORDER BY updated_at DESC LIMIT 6"
+            "SELECT id,{title},{subtitle} FROM {table} WHERE {predicate} ORDER BY updated_at DESC LIMIT 6"
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([&pattern], |row| {
@@ -1375,17 +1775,33 @@ pub fn weekly_summary(
         params![start_date, end_date],
         |r| r.get(0),
     )?;
-    let published: i64 = connection.query_row(
-        "SELECT count(*) FROM content_items WHERE status IN('published','review') AND COALESCE(NULLIF(substr(publish_at,1,10),''), substr(updated_at,1,10)) BETWEEN ?1 AND ?2",
-        params![start_date, end_date],
-        |row| row.get(0),
-    )?;
-    let portfolio = portfolio_snapshot(connection)?;
+    let published = list_content(connection)?
+        .into_iter()
+        .filter(|item| {
+            let value = item
+                .publish_at
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&item.updated_at);
+            matches!(item.status.as_str(), "published" | "review")
+                && shanghai_calendar_date(value)
+                    .is_some_and(|date| date.as_str() >= start_date && date.as_str() <= end_date)
+        })
+        .count();
+    let investment = match portfolio_snapshot(connection) {
+        Ok(portfolio) if portfolio.valuation_complete => format!(
+            "当前投资组合市值 ¥{}，未实现收益 ¥{}。",
+            portfolio.total_market_value, portfolio.unrealized_gain
+        ),
+        Ok(portfolio) => format!(
+            "{} 项持仓缺少价格，当前可估值市值小计 ¥{}；投资汇总不完整。",
+            portfolio.missing_price_count, portfolio.total_market_value
+        ),
+        Err(_) => "投资摘要暂不可用，请先修正投资记录；其他复盘信息不受影响。".into(),
+    };
     Ok(format!(
-        "本周完成 {completed} 项任务，累计习惯打卡 {habit_checks} 次，记录工作 {} 小时，发布内容 {published} 条。当前投资组合市值 ¥{}，未实现收益 ¥{}。",
+        "本周完成 {completed} 项任务，累计习惯打卡 {habit_checks} 次，记录工作 {} 小时，发布内容 {published} 条。{investment}",
         Decimal::from(work_minutes) / Decimal::from(60),
-        portfolio.total_market_value,
-        portfolio.unrealized_gain
     ))
 }
 
@@ -1414,6 +1830,375 @@ mod tests {
         database::open_database,
         models::{Instrument, InvestmentAccount, PortfolioTransaction},
     };
+    use std::str::FromStr;
+
+    fn linked_task_draft() -> Task {
+        serde_json::from_value(serde_json::json!({"id":"", "title":"备稿", "notes":"", "status":"todo", "priority":2, "dueDate":"2026-10-03", "recurrence":"none", "createdAt":"", "updatedAt":""})).unwrap()
+    }
+
+    #[test]
+    fn log_task_creation_is_atomic_idempotent_and_deletion_keeps_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("linked.sqlite3");
+        let key = [42; 32];
+        let db = open_database(&path, &key).unwrap();
+        db.execute_batch("INSERT INTO work_logs(id,log_date,title,markdown,minutes,created_at,updated_at) VALUES('log','2026-10-03','原始日志','保留笔记',60,'now','now');").unwrap();
+        // No task is inferred from a work record until the explicit command.
+        assert!(list_tasks(&db).unwrap().is_empty());
+        let mut bad = linked_task_draft();
+        bad.project_id = Some("missing-project".into());
+        assert!(create_task_from_work_log(&db, "log", bad).is_err());
+        assert!(list_tasks(&db).unwrap().is_empty());
+        assert!(list_work_logs(&db).unwrap()[0].task_id.is_none());
+        assert_eq!(
+            create_task_from_work_log(&db, "missing-log", linked_task_draft())
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        db.execute_batch("CREATE TRIGGER fail_log_link BEFORE UPDATE OF task_id ON work_logs BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+        assert!(create_task_from_work_log(&db, "log", linked_task_draft()).is_err());
+        assert!(list_tasks(&db).unwrap().is_empty()); // No orphan after failed link.
+        db.execute_batch("DROP TRIGGER fail_log_link;").unwrap();
+        let saved = create_task_from_work_log(&db, "log", linked_task_draft()).unwrap();
+        let again = create_task_from_work_log(&db, "log", linked_task_draft()).unwrap();
+        assert_eq!(saved.id, again.id);
+        assert_eq!(list_tasks(&db).unwrap().len(), 1);
+        drop(db);
+        let db = open_database(&path, &key).unwrap();
+        let log = &list_work_logs(&db).unwrap()[0];
+        assert_eq!(log.task_id.as_deref(), Some(saved.id.as_str()));
+        assert_eq!(log.markdown, "保留笔记");
+        assert_eq!(log.minutes, 60);
+        delete_record(&db, "task", &saved.id).unwrap();
+        let logs = list_work_logs(&db).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].task_id.is_none());
+        assert_eq!(logs[0].title, "原始日志");
+    }
+
+    #[test]
+    fn dashboard_counts_all_eligible_tasks_but_bounds_each_display_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open_database(&directory.path().join("counts.sqlite3"), &[43; 32]).unwrap();
+        for i in 0..10 {
+            db.execute("INSERT INTO tasks(id,title,due_date,created_at,updated_at) VALUES(?1,'待办','2026-10-03','now','now')", [format!("p{i}")]).unwrap();
+        }
+        for i in 0..7 {
+            db.execute("INSERT INTO tasks(id,title,status,completed_at,created_at,updated_at) VALUES(?1,'完成','done','2026-10-02T16:30:00Z','now','now')", [format!("d{i}")]).unwrap();
+        }
+        db.execute_batch("INSERT INTO tasks(id,title,due_date,created_at,updated_at) VALUES('future','未来任务','2026-10-04','now','now'); INSERT INTO tasks(id,title,due_date,scheduled_start,created_at,updated_at) VALUES('planned','今天计划开始','2026-10-04','2026-10-02T16:30:00Z','now','now'); INSERT INTO tasks(id,title,status,completed_at,created_at,updated_at) VALUES('old','昨天完成','done','2026-10-02T15:30:00Z','now','now');").unwrap();
+        let result = dashboard(&db, "2026-10-03").unwrap();
+        assert_eq!(result.pending_task_count, 11);
+        assert_eq!(result.completed_task_count, 7);
+        assert_eq!(
+            result.tasks.iter().filter(|t| t.status != "done").count(),
+            5
+        );
+        assert_eq!(
+            result.tasks.iter().filter(|t| t.status == "done").count(),
+            3
+        );
+        assert!(
+            !result
+                .tasks
+                .iter()
+                .any(|t| t.id == "future" || t.id == "old")
+        );
+    }
+
+    #[test]
+    fn task_priority_precedes_todo_doing_status_and_latest_completion_is_previewed() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open_database(&directory.path().join("priority.sqlite3"), &[45; 32]).unwrap();
+        db.execute_batch("INSERT INTO tasks(id,title,status,priority,due_date,created_at,updated_at) VALUES('normal','普通待办','todo',2,'2026-10-03','now','now'); INSERT INTO tasks(id,title,status,priority,due_date,created_at,updated_at) VALUES('important','重要进行中','doing',1,'2026-10-03','now','now');").unwrap();
+        for i in 0..4 {
+            db.execute("INSERT INTO tasks(id,title,status,completed_at,created_at,updated_at) VALUES(?1,'完成','done',?2,'now','now')", params![format!("d{i}"),format!("2026-10-03T0{i}:00:00Z")]).unwrap();
+        }
+        let result = dashboard(&db, "2026-10-03").unwrap();
+        assert_eq!(result.tasks[0].id, "important");
+        assert_eq!(result.tasks[1].id, "normal");
+        assert_eq!(result.tasks[2].id, "d3");
+        assert_eq!(result.tasks[4].id, "d1");
+        assert_eq!(result.completed_task_count, 4);
+    }
+
+    #[test]
+    fn manual_price_is_dated_and_wins_same_day_quotes_without_erasing_history() {
+        let (_directory, connection, _, mut instrument, _, _) = portfolio_mutation_fixture();
+        let today = Utc::now()
+            .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
+            .format("%Y-%m-%d")
+            .to_string();
+        upsert_price(
+            &connection,
+            PricePointInput {
+                instrument_id: instrument.id.clone(),
+                price_date: "2000-01-01".into(),
+                price: "11".into(),
+                source: "tushare".into(),
+            },
+        )
+        .unwrap();
+        instrument.manual_price = Some("20".into());
+        instrument = upsert_instrument(&connection, instrument).unwrap();
+        upsert_price(
+            &connection,
+            PricePointInput {
+                instrument_id: instrument.id.clone(),
+                price_date: today,
+                price: "12".into(),
+                source: "tushare".into(),
+            },
+        )
+        .unwrap();
+        let snapshot = portfolio_snapshot(&connection).unwrap();
+        assert_eq!(snapshot.holdings[0].current_price, "20");
+        assert_eq!(snapshot.holdings[0].price_source, "manual");
+        instrument.manual_price = None;
+        upsert_instrument(&connection, instrument).unwrap();
+        assert_eq!(
+            portfolio_snapshot(&connection).unwrap().holdings[0].current_price,
+            "20"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM price_points", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn dividends_deduct_fees_and_zero_quantity_trades_cannot_disappear() {
+        let (_directory, connection, account, instrument, _, _) = portfolio_mutation_fixture();
+        let count = list_transactions(&connection).unwrap().len();
+        for kind in ["buy", "sell", "subscribe", "redeem"] {
+            assert_eq!(
+                upsert_transaction(
+                    &connection,
+                    transaction(
+                        &account.id,
+                        &instrument.id,
+                        kind,
+                        "2026-01-05",
+                        "0",
+                        "1",
+                        "100",
+                        "0",
+                        "0"
+                    )
+                )
+                .unwrap_err()
+                .code,
+                "INVALID_TRANSACTION_QUANTITY"
+            );
+        }
+        assert_eq!(list_transactions(&connection).unwrap().len(), count);
+        upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "dividend",
+                "2026-01-05",
+                "0",
+                "0",
+                "10",
+                "1",
+                "2",
+            ),
+        )
+        .unwrap();
+        assert_eq!(portfolio_snapshot(&connection).unwrap().realized_gain, "12");
+    }
+
+    #[test]
+    fn closing_entire_position_allocates_exact_remaining_cost() {
+        let (_directory, connection, account, instrument, _, _) = portfolio_mutation_fixture();
+        connection
+            .execute("DELETE FROM portfolio_transactions", [])
+            .unwrap();
+        upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "buy",
+                "2026-01-01",
+                "3",
+                "0",
+                "1",
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "sell",
+                "2026-01-02",
+                "3",
+                "0",
+                "2",
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        let closed = portfolio_snapshot(&connection).unwrap();
+        assert_eq!(closed.total_cost, "0");
+        assert_eq!(closed.holdings[0].quantity, "0");
+        assert_eq!(closed.realized_gain, "1");
+    }
+
+    #[test]
+    fn missing_price_is_unknown_not_total_loss_but_an_explicit_zero_is_valid() {
+        let (_directory, connection, _, mut instrument, _, _) = portfolio_mutation_fixture();
+        instrument.manual_price = None;
+        instrument = upsert_instrument(&connection, instrument).unwrap();
+        connection.execute("DELETE FROM price_points", []).unwrap();
+        let missing = portfolio_snapshot(&connection).unwrap();
+        assert!(!missing.valuation_complete);
+        assert_eq!(missing.missing_price_count, 1);
+        assert_eq!(missing.unrealized_gain, "0");
+        assert_eq!(missing.total_cost, "20");
+        instrument.manual_price = Some("0".into());
+        upsert_instrument(&connection, instrument).unwrap();
+        let zero = portfolio_snapshot(&connection).unwrap();
+        assert!(zero.valuation_complete);
+        assert_eq!(zero.unrealized_gain, "-20");
+    }
+
+    #[test]
+    fn cash_withdrawal_is_signed_and_insufficient_balance_rolls_back() {
+        let (_directory, connection, account, mut instrument, _, _) = portfolio_mutation_fixture();
+        connection
+            .execute("DELETE FROM portfolio_transactions", [])
+            .unwrap();
+        instrument.kind = "cash".into();
+        instrument.manual_price = Some("1".into());
+        instrument = upsert_instrument(&connection, instrument).unwrap();
+        upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "adjustment",
+                "2026-01-01",
+                "0",
+                "0",
+                "100",
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "adjustment",
+                "2026-01-02",
+                "0",
+                "0",
+                "-30",
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            portfolio_snapshot(&connection).unwrap().total_market_value,
+            "70"
+        );
+        assert_eq!(
+            upsert_transaction(
+                &connection,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    "adjustment",
+                    "2026-01-03",
+                    "0",
+                    "0",
+                    "-71",
+                    "0",
+                    "0"
+                )
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_POSITION_ADJUSTMENT"
+        );
+        assert_eq!(list_transactions(&connection).unwrap().len(), 2);
+        assert_eq!(portfolio_snapshot(&connection).unwrap().total_cost, "70");
+    }
+
+    #[test]
+    fn search_treats_sql_wildcards_literally_and_matches_instrument_codes() {
+        let (_directory, connection, _, instrument, _, _) = portfolio_mutation_fixture();
+        assert!(
+            search(&connection, &instrument.code)
+                .unwrap()
+                .iter()
+                .any(|row| row.id == instrument.id)
+        );
+        assert!(search(&connection, "%").unwrap().is_empty());
+        assert!(search(&connection, "_").unwrap().is_empty());
+        assert!(search(&connection, "\\").unwrap().is_empty());
+    }
+
+    #[test]
+    fn calendar_stores_utc_and_next_occurrence_includes_overnight_and_next_day() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection =
+            open_database(&directory.path().join("calendar.sqlite3"), &[39; 32]).unwrap();
+        let item = upsert_calendar(
+            &connection,
+            CalendarItem {
+                id: String::new(),
+                kind: "event".into(),
+                title: "跨午夜".into(),
+                notes: String::new(),
+                start_at: "2026-08-03T23:00".into(),
+                end_at: "2026-08-04T01:00".into(),
+                all_day: false,
+                recurrence: "weekly".into(),
+                source: "internal".into(),
+                external_uid: None,
+                project_id: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(item.start_at, "2026-08-03T15:00:00Z");
+        let overnight =
+            next_calendar_occurrence(item.clone(), NaiveDate::from_ymd_opt(2026, 8, 11).unwrap())
+                .unwrap();
+        assert_eq!(overnight.start_at, "2026-08-10T15:00:00Z");
+        let after = next_calendar_occurrence_after(
+            item.clone(),
+            NaiveDate::from_ymd_opt(2026, 8, 11).unwrap(),
+            Some(
+                NaiveDate::from_ymd_opt(2026, 8, 11)
+                    .unwrap()
+                    .and_hms_opt(2, 0, 0)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(after.start_at, "2026-08-17T15:00:00Z");
+        assert!(
+            next_calendar_occurrence(item, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()).is_some()
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn transaction(
@@ -1517,8 +2302,8 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 8, 10).unwrap(),
         )
         .unwrap();
-        assert_eq!(occurrence.start_at, "2026-08-10T23:00");
-        assert_eq!(occurrence.end_at, "2026-08-11T01:00");
+        assert_eq!(occurrence.start_at, "2026-08-10T15:00:00Z");
+        assert_eq!(occurrence.end_at, "2026-08-10T17:00:00Z");
     }
 
     #[test]
@@ -1771,6 +2556,699 @@ mod tests {
         assert_eq!(list_transactions(&connection).unwrap().len(), 1);
     }
 
+    fn portfolio_mutation_fixture() -> (
+        tempfile::TempDir,
+        Connection,
+        InvestmentAccount,
+        Instrument,
+        PortfolioTransaction,
+        PortfolioTransaction,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let connection =
+            open_database(&directory.path().join("mutation.sqlite3"), &[81; 32]).unwrap();
+        let account = upsert_account(
+            &connection,
+            InvestmentAccount {
+                id: String::new(),
+                name: "交易一致性测试账户".into(),
+                kind: "securities".into(),
+                currency: "CNY".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+        let instrument = upsert_instrument(
+            &connection,
+            Instrument {
+                id: String::new(),
+                code: "510300".into(),
+                name: "测试 ETF".into(),
+                kind: "etf".into(),
+                market: "CN".into(),
+                currency: "CNY".into(),
+                manual_price: Some("4".into()),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+        let buy = upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "buy",
+                "2026-01-01",
+                "10",
+                "4",
+                "0",
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        let sell = upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "sell",
+                "2026-01-02",
+                "5",
+                "5",
+                "0",
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        (directory, connection, account, instrument, buy, sell)
+    }
+
+    #[test]
+    fn financial_decimal_inputs_reject_truncation_and_oversized_text() {
+        for value in [
+            Decimal::MAX.to_string(),
+            Decimal::MIN.to_string(),
+            "0.0000000000000000000000000001".into(),
+            "123.4567".into(),
+        ] {
+            assert_eq!(
+                decimal_string(parse_decimal(&value, "测试数字").unwrap()),
+                value
+            );
+        }
+        for value in [
+            "79228162514264337593543950336".to_owned(),
+            "0.00000000000000000000000000001".into(),
+            "1.12345678901234567890123456789".into(),
+            "NaN".into(),
+            "1e100".into(),
+            "0".repeat(129),
+        ] {
+            let error = parse_decimal(&value, "测试数字").unwrap_err();
+            assert_eq!(error.code, "INVALID_DECIMAL");
+            assert!(error.recovery.is_some());
+            assert!(!error.message.contains(&value));
+        }
+        assert_eq!(
+            parse_decimal(" 1.2500 ", "测试数字").unwrap(),
+            Decimal::new(125, 2)
+        );
+    }
+
+    #[test]
+    fn financial_checked_operations_return_errors_instead_of_panicking() {
+        for value in [
+            Decimal::MAX.checked_add(Decimal::ONE),
+            Decimal::MIN.checked_sub(Decimal::ONE),
+            Decimal::MAX.checked_mul(Decimal::TWO),
+            Decimal::MAX.checked_div(Decimal::new(1, 28)),
+            Decimal::ONE.checked_div(Decimal::ZERO),
+        ] {
+            let error = checked_financial(value, "边界测试").unwrap_err();
+            assert_eq!(error.code, "FINANCIAL_OVERFLOW");
+            assert!(error.recovery.is_some());
+        }
+        assert_eq!(
+            checked_financial(
+                Decimal::new(1234567, 4).checked_mul(Decimal::new(12345, 4)),
+                "精度测试"
+            )
+            .unwrap()
+            .to_string(),
+            "152.40729615"
+        );
+    }
+
+    #[test]
+    fn financial_transaction_overflow_rolls_back_and_keeps_dashboard_readable() {
+        let maximum = Decimal::MAX.to_string();
+        let cases = [
+            ("buy", maximum.as_str(), "2", "0", "0", "0"),
+            ("buy", maximum.as_str(), "0", "1", "0", "0"),
+            ("buy", "1", "1", maximum.as_str(), "0", "0"),
+            ("buy", "1", "1", maximum.as_str(), "1", "0"),
+            ("sell", "5", maximum.as_str(), "0", "0", "0"),
+            ("sell", "1", "1", "0", maximum.as_str(), maximum.as_str()),
+            ("fee", "0", "0", maximum.as_str(), "1", "0"),
+            ("adjustment", maximum.as_str(), "0", "1", "0", "0"),
+            ("dividend", "0", "0", maximum.as_str(), "0", "0"),
+        ];
+        for (kind, quantity, price, amount, fee, tax) in cases {
+            let (_directory, connection, account, instrument, _, _) = portfolio_mutation_fixture();
+            let before = serde_json::to_value(list_transactions(&connection).unwrap()).unwrap();
+            let snapshot = serde_json::to_value(portfolio_snapshot(&connection).unwrap()).unwrap();
+            let error = upsert_transaction(
+                &connection,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    kind,
+                    "2026-01-03",
+                    quantity,
+                    price,
+                    amount,
+                    fee,
+                    tax,
+                ),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, "FINANCIAL_OVERFLOW",
+                "{kind}: {quantity}, {price}, {amount}"
+            );
+            assert!(connection.is_autocommit());
+            assert_eq!(
+                serde_json::to_value(list_transactions(&connection).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(portfolio_snapshot(&connection).unwrap()).unwrap(),
+                snapshot
+            );
+            dashboard(&connection, "2026-01-03").unwrap();
+            upsert_transaction(
+                &connection,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    "buy",
+                    "2026-01-03",
+                    "1",
+                    "4",
+                    "0",
+                    "0",
+                    "0",
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn financial_failed_update_cannot_leak_into_outer_commit_or_restart() {
+        let (directory, connection, account, _, mut buy, _) = portfolio_mutation_fixture();
+        let before = serde_json::to_value(list_transactions(&connection).unwrap()).unwrap();
+        let outer = connection.unchecked_transaction().unwrap();
+        outer
+            .execute(
+                "UPDATE investment_accounts SET name='外层正常修改' WHERE id=?1",
+                [&account.id],
+            )
+            .unwrap();
+        buy.unit_price = Decimal::MAX.to_string();
+        assert_eq!(
+            upsert_transaction(&outer, buy).unwrap_err().code,
+            "FINANCIAL_OVERFLOW"
+        );
+        assert!(!outer.is_autocommit());
+        outer.commit().unwrap();
+        drop(connection);
+        let reopened =
+            open_database(&directory.path().join("mutation.sqlite3"), &[81; 32]).unwrap();
+        assert_eq!(
+            serde_json::to_value(list_transactions(&reopened).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(list_accounts(&reopened).unwrap()[0].name, "外层正常修改");
+        dashboard(&reopened, "2026-01-03").unwrap();
+    }
+
+    #[test]
+    fn financial_average_cost_and_cash_accumulation_overflow_are_rejected() {
+        let (_directory, connection, account, mut instrument, _, _) = portfolio_mutation_fixture();
+        connection
+            .execute("DELETE FROM portfolio_transactions", [])
+            .unwrap();
+        instrument.manual_price = Some("0".into());
+        instrument = upsert_instrument(&connection, instrument).unwrap();
+        assert_eq!(
+            upsert_transaction(
+                &connection,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    "buy",
+                    "2026-01-01",
+                    "0.0000000000000000000000000001",
+                    "0",
+                    "10",
+                    "0",
+                    "0"
+                )
+            )
+            .unwrap_err()
+            .code,
+            "FINANCIAL_OVERFLOW"
+        );
+        assert!(list_transactions(&connection).unwrap().is_empty());
+        instrument.kind = "cash".into();
+        instrument = upsert_instrument(&connection, instrument).unwrap();
+        upsert_transaction(
+            &connection,
+            transaction(
+                &account.id,
+                &instrument.id,
+                "adjustment",
+                "2026-01-01",
+                "0",
+                "0",
+                &Decimal::MAX.to_string(),
+                "0",
+                "0",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            upsert_transaction(
+                &connection,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    "adjustment",
+                    "2026-01-02",
+                    "0",
+                    "0",
+                    "1",
+                    "0",
+                    "0"
+                )
+            )
+            .unwrap_err()
+            .code,
+            "FINANCIAL_OVERFLOW"
+        );
+        assert_eq!(list_transactions(&connection).unwrap().len(), 1);
+        assert_eq!(
+            portfolio_snapshot(&connection).unwrap().total_cost,
+            Decimal::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn financial_overflowing_manual_and_quote_prices_restore_previous_values() {
+        for nested in [false, true] {
+            let (_directory, connection, _, mut instrument, _, _) = portfolio_mutation_fixture();
+            let before = serde_json::to_value(portfolio_snapshot(&connection).unwrap()).unwrap();
+            let outer = nested.then(|| connection.unchecked_transaction().unwrap());
+            instrument.manual_price = Some(Decimal::MAX.to_string());
+            assert_eq!(
+                upsert_instrument(&connection, instrument.clone())
+                    .unwrap_err()
+                    .code,
+                "FINANCIAL_OVERFLOW"
+            );
+            assert_eq!(
+                list_instruments(&connection).unwrap()[0]
+                    .manual_price
+                    .as_deref(),
+                Some("4")
+            );
+            for source in ["manual", "tushare"] {
+                let input = |price: &str| PricePointInput {
+                    instrument_id: instrument.id.clone(),
+                    // Later than the automatically recorded manual point;
+                    // source precedence is tested separately.
+                    price_date: if source == "manual" {
+                        "2099-01-03"
+                    } else {
+                        "2099-01-04"
+                    }
+                    .into(),
+                    price: price.into(),
+                    source: source.into(),
+                };
+                assert_eq!(
+                    upsert_price(&connection, input(&Decimal::MAX.to_string()))
+                        .unwrap_err()
+                        .code,
+                    "FINANCIAL_OVERFLOW"
+                );
+                let count: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM price_points", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, if source == "manual" { 1 } else { 2 });
+                upsert_price(&connection, input("4")).unwrap();
+                assert_eq!(
+                    upsert_price(&connection, input(&Decimal::MAX.to_string()))
+                        .unwrap_err()
+                        .code,
+                    "FINANCIAL_OVERFLOW"
+                );
+                let price: String = connection
+                    .query_row(
+                        "SELECT price FROM price_points WHERE source=?1 ORDER BY price_date DESC LIMIT 1",
+                        [source],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(price, "4");
+            }
+            assert_eq!(connection.is_autocommit(), !nested);
+            if let Some(outer) = outer {
+                outer.commit().unwrap();
+            }
+            let after = portfolio_snapshot(&connection).unwrap();
+            assert_eq!(
+                after.total_market_value,
+                before["totalMarketValue"].as_str().unwrap()
+            );
+            dashboard(&connection, "2026-01-03").unwrap();
+        }
+    }
+
+    #[test]
+    fn financial_portfolio_totals_check_overflow_across_accounts() {
+        for mode in ["market", "cost", "realized"] {
+            let (_directory, connection, mut account, mut instrument, _, _) =
+                portfolio_mutation_fixture();
+            connection
+                .execute("DELETE FROM portfolio_transactions", [])
+                .unwrap();
+            instrument.manual_price = Some(if mode == "market" {
+                Decimal::MAX.to_string()
+            } else {
+                "0".into()
+            });
+            instrument = upsert_instrument(&connection, instrument).unwrap();
+            let maximum = Decimal::MAX.to_string();
+            let (kind, quantity, amount) = match mode {
+                "market" => ("buy", "1", "0"),
+                "cost" => ("buy", "1", maximum.as_str()),
+                _ => ("dividend", "0", maximum.as_str()),
+            };
+            upsert_transaction(
+                &connection,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    kind,
+                    "2026-01-01",
+                    quantity,
+                    "0",
+                    amount,
+                    "0",
+                    "0",
+                ),
+            )
+            .unwrap();
+            account.id.clear();
+            account.name = "第二个测试账户".into();
+            account = upsert_account(&connection, account).unwrap();
+            assert_eq!(
+                upsert_transaction(
+                    &connection,
+                    transaction(
+                        &account.id,
+                        &instrument.id,
+                        kind,
+                        "2026-01-02",
+                        quantity,
+                        "0",
+                        amount,
+                        "0",
+                        "0"
+                    )
+                )
+                .unwrap_err()
+                .code,
+                "FINANCIAL_OVERFLOW"
+            );
+            assert_eq!(list_transactions(&connection).unwrap().len(), 1);
+            portfolio_snapshot(&connection).unwrap();
+        }
+    }
+
+    #[test]
+    fn financial_existing_out_of_range_data_returns_error_without_mutating_it() {
+        let (_directory, connection, _, instrument, _, _) = portfolio_mutation_fixture();
+        connection
+            .execute(
+                "UPDATE instruments SET manual_price=?1 WHERE id=?2",
+                params![Decimal::MAX.to_string(), instrument.id],
+            )
+            .unwrap();
+        assert_eq!(
+            portfolio_snapshot(&connection).unwrap_err().code,
+            "FINANCIAL_OVERFLOW"
+        );
+        let degraded = dashboard(&connection, "2026-01-03").unwrap();
+        assert!(degraded.portfolio_error.is_some());
+        assert_eq!(list_transactions(&connection).unwrap().len(), 2);
+        let mut instrument = list_instruments(&connection).unwrap().remove(0);
+        instrument.manual_price = Some("4".into());
+        upsert_instrument(&connection, instrument).unwrap();
+        dashboard(&connection, "2026-01-03").unwrap();
+    }
+
+    #[test]
+    fn deleting_required_buy_rolls_back_and_preserves_dashboard() {
+        let (directory, connection, _, _, buy, _) = portfolio_mutation_fixture();
+        let before = serde_json::to_value(list_transactions(&connection).unwrap()).unwrap();
+        let portfolio_before =
+            serde_json::to_value(portfolio_snapshot(&connection).unwrap()).unwrap();
+        let error = delete_record(&connection, "transaction", &buy.id).unwrap_err();
+        assert_eq!(error.code, "INSUFFICIENT_POSITION");
+        assert!(error.recovery.unwrap().contains("本次删除已取消"));
+        assert!(connection.is_autocommit());
+        assert_eq!(
+            serde_json::to_value(list_transactions(&connection).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(portfolio_snapshot(&connection).unwrap()).unwrap(),
+            portfolio_before
+        );
+        assert!(dashboard(&connection, "2026-01-02").is_ok());
+        drop(connection);
+        let reopened =
+            open_database(&directory.path().join("mutation.sqlite3"), &[81; 32]).unwrap();
+        assert_eq!(
+            serde_json::to_value(list_transactions(&reopened).unwrap()).unwrap(),
+            before
+        );
+        assert!(dashboard(&reopened, "2026-01-02").is_ok());
+    }
+
+    #[test]
+    fn valid_transaction_deletion_recalculates_and_preserves_other_delete_contracts() {
+        let (_directory, connection, _, _, buy, sell) = portfolio_mutation_fixture();
+        delete_record(&connection, "transaction", &sell.id).unwrap();
+        let snapshot = portfolio_snapshot(&connection).unwrap();
+        assert_eq!(snapshot.holdings[0].quantity, "10");
+        assert_eq!(snapshot.total_cost, "40");
+        assert_eq!(snapshot.realized_gain, "0");
+        assert_eq!(
+            delete_record(&connection, "transaction", &sell.id)
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        delete_record(&connection, "transaction", &buy.id).unwrap();
+        assert!(portfolio_snapshot(&connection).unwrap().holdings.is_empty());
+        assert!(connection.is_autocommit());
+        connection.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('ordinary','normal','work','active','#000','','now','now')", []).unwrap();
+        delete_record(&connection, "project", "ordinary").unwrap();
+        assert_eq!(
+            delete_record(&connection, "project", "ordinary")
+                .unwrap_err()
+                .code,
+            "NOT_FOUND"
+        );
+        assert_eq!(
+            delete_record(&connection, "transactions; DROP TABLE projects", "x")
+                .unwrap_err()
+                .code,
+            "INVALID_RECORD_KIND"
+        );
+        assert!(list_projects(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn later_or_other_account_purchases_cannot_cover_an_invalid_deletion() {
+        for other_account in [false, true] {
+            let (_directory, connection, account, instrument, buy, _) =
+                portfolio_mutation_fixture();
+            let purchase_account = if other_account {
+                upsert_account(
+                    &connection,
+                    InvestmentAccount {
+                        id: String::new(),
+                        name: "其他账户".into(),
+                        ..account.clone()
+                    },
+                )
+                .unwrap()
+            } else {
+                account
+            };
+            upsert_transaction(
+                &connection,
+                transaction(
+                    &purchase_account.id,
+                    &instrument.id,
+                    "buy",
+                    if other_account {
+                        "2026-01-01"
+                    } else {
+                        "2026-01-03"
+                    },
+                    "100",
+                    "4",
+                    "0",
+                    "0",
+                    "0",
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                delete_record(&connection, "transaction", &buy.id)
+                    .unwrap_err()
+                    .code,
+                "INSUFFICIENT_POSITION"
+            );
+            assert_eq!(list_transactions(&connection).unwrap().len(), 3);
+            assert!(portfolio_snapshot(&connection).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejected_delete_update_and_insert_do_not_leak_into_an_outer_commit() {
+        let (directory, connection, account, instrument, buy, _) = portfolio_mutation_fixture();
+        let before = serde_json::to_value(list_transactions(&connection).unwrap()).unwrap();
+        let outer = connection.unchecked_transaction().unwrap();
+        outer.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('outer','keep outer work','work','active','#000','','now','now')", []).unwrap();
+        assert_eq!(
+            delete_record(&outer, "transaction", &buy.id)
+                .unwrap_err()
+                .code,
+            "INSUFFICIENT_POSITION"
+        );
+        let mut changed_buy = buy;
+        changed_buy.quantity = "1".into();
+        assert_eq!(
+            upsert_transaction(&outer, changed_buy).unwrap_err().code,
+            "INSUFFICIENT_POSITION"
+        );
+        assert_eq!(
+            upsert_transaction(
+                &outer,
+                transaction(
+                    &account.id,
+                    &instrument.id,
+                    "sell",
+                    "2026-01-03",
+                    "99",
+                    "4",
+                    "0",
+                    "0",
+                    "0",
+                )
+            )
+            .unwrap_err()
+            .code,
+            "INSUFFICIENT_POSITION"
+        );
+        assert!(!outer.is_autocommit());
+        assert_eq!(
+            serde_json::to_value(list_transactions(&outer).unwrap()).unwrap(),
+            before
+        );
+        outer.commit().unwrap();
+        drop(connection);
+        let reopened =
+            open_database(&directory.path().join("mutation.sqlite3"), &[81; 32]).unwrap();
+        assert_eq!(
+            serde_json::to_value(list_transactions(&reopened).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(list_projects(&reopened).unwrap()[0].id, "outer");
+        assert!(dashboard(&reopened, "2026-01-03").is_ok());
+    }
+
+    #[test]
+    fn successful_nested_mutations_remain_owned_by_the_outer_transaction() {
+        let (_directory, connection, _, _, buy, sell) = portfolio_mutation_fixture();
+        let before = serde_json::to_value(list_transactions(&connection).unwrap()).unwrap();
+        let outer = connection.unchecked_transaction().unwrap();
+        delete_record(&outer, "transaction", &sell.id).unwrap();
+        let mut changed_buy = buy;
+        changed_buy.quantity = "20".into();
+        upsert_transaction(&outer, changed_buy).unwrap();
+        assert_eq!(
+            portfolio_snapshot(&outer).unwrap().holdings[0].quantity,
+            "20"
+        );
+        assert!(!outer.is_autocommit());
+        outer.rollback().unwrap();
+        assert_eq!(
+            serde_json::to_value(list_transactions(&connection).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn failed_sql_deletion_releases_its_savepoint_without_losing_records() {
+        let (_directory, connection, _, _, _, sell) = portfolio_mutation_fixture();
+        connection.execute_batch("CREATE TEMP TRIGGER prevent_trade_delete BEFORE DELETE ON portfolio_transactions BEGIN SELECT RAISE(ABORT,'injected deletion failure'); END;").unwrap();
+        assert_eq!(
+            delete_record(&connection, "transaction", &sell.id)
+                .unwrap_err()
+                .code,
+            "DATABASE_ERROR"
+        );
+        assert_eq!(list_transactions(&connection).unwrap().len(), 2);
+        assert!(connection.is_autocommit());
+        connection
+            .execute_batch("DROP TRIGGER prevent_trade_delete")
+            .unwrap();
+        delete_record(&connection, "transaction", &sell.id).unwrap();
+        assert_eq!(list_transactions(&connection).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn portfolio_savepoint_rolls_back_during_unwinding() {
+        let (_directory, connection, _, _, buy, _) = portfolio_mutation_fixture();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: CommandResult<()> = with_portfolio_savepoint(&connection, || {
+                connection.execute("DELETE FROM portfolio_transactions WHERE id=?1", [&buy.id])?;
+                panic!("isolated mutation panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(list_transactions(&connection).unwrap().len(), 2);
+        assert!(connection.is_autocommit());
+        assert!(dashboard(&connection, "2026-01-02").is_ok());
+    }
+
+    #[test]
+    fn database_forced_rollback_cannot_leave_a_rejected_mutation_committable() {
+        let (_directory, connection, _, _, _, sell) = portfolio_mutation_fixture();
+        connection.execute_batch("CREATE TEMP TRIGGER abort_trade_transaction BEFORE DELETE ON portfolio_transactions BEGIN SELECT RAISE(ROLLBACK,'injected transaction rollback'); END;").unwrap();
+        let outer = connection.unchecked_transaction().unwrap();
+        outer.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('outer','uncommitted work','work','active','#000','','now','now')", []).unwrap();
+        assert_eq!(
+            delete_record(&outer, "transaction", &sell.id)
+                .unwrap_err()
+                .code,
+            "DATABASE_ERROR"
+        );
+        // SQLite itself aborted the whole transaction. Cleanup must not report
+        // success, leave a rejected trade behind, or revive that transaction.
+        assert!(outer.is_autocommit());
+        assert!(outer.commit().is_err());
+        assert!(list_projects(&connection).unwrap().is_empty());
+        assert_eq!(list_transactions(&connection).unwrap().len(), 2);
+        connection
+            .execute_batch("DROP TRIGGER abort_trade_transaction")
+            .unwrap();
+        delete_record(&connection, "transaction", &sell.id).unwrap();
+        assert!(portfolio_snapshot(&connection).is_ok());
+    }
+
     #[test]
     fn dashboard_counts_completed_tasks_by_shanghai_calendar_day() {
         let directory = tempfile::tempdir().unwrap();
@@ -1794,16 +3272,24 @@ mod tests {
             [],
         ).unwrap();
 
+        connection.execute_batch("INSERT INTO work_logs(id,log_date,title,task_id,created_at,updated_at) VALUES('history-log','2026-08-29','本次复盘','repeat-task','now','now');").unwrap();
         let next = toggle_task(&connection, "repeat-task", true).unwrap();
         assert_eq!(next.status, "todo");
         assert_eq!(next.due_date.as_deref(), Some("2026-08-30"));
-        assert_eq!(next.scheduled_start.as_deref(), Some("2026-08-30T20:00"));
+        assert_eq!(
+            next.scheduled_start.as_deref(),
+            Some("2026-08-30T12:00:00Z")
+        );
 
         let tasks = list_tasks(&connection).unwrap();
         let history = tasks.iter().find(|task| task.id != "repeat-task").unwrap();
         assert_eq!(history.status, "done");
         assert_eq!(history.recurrence, "none");
         assert_eq!(history.due_date.as_deref(), Some("2026-08-29"));
+        assert_eq!(
+            list_work_logs(&connection).unwrap()[0].task_id.as_deref(),
+            Some(history.id.as_str())
+        );
     }
 
     #[test]
@@ -1962,6 +3448,7 @@ mod tests {
             &connection,
             WorkLog {
                 id: String::new(),
+                task_id: Some(task.id.clone()),
                 log_date: "2026-08-30".into(),
                 project_id: Some(project.id.clone()),
                 title: "端到端工作记录".into(),
@@ -2121,9 +3608,10 @@ mod tests {
         assert_eq!(list_instruments(&reopened).unwrap().len(), 1);
         assert_eq!(list_transactions(&reopened).unwrap().len(), 1);
         let snapshot = portfolio_snapshot(&reopened).unwrap();
-        assert_eq!(snapshot.holdings[0].current_price, "4.5");
-        assert_eq!(snapshot.holdings[0].market_value, "45");
-        assert_eq!(snapshot.holdings[0].unrealized_gain, "2.75");
+        // Historical point must not override the newer manual input.
+        assert_eq!(snapshot.holdings[0].current_price, "4.125");
+        assert_eq!(snapshot.holdings[0].market_value, "41.25");
+        assert_eq!(snapshot.holdings[0].unrealized_gain, "-1");
         assert_eq!(list_reviews(&reopened).unwrap()[0].status, "confirmed");
         assert_eq!(settings(&reopened).unwrap().theme, "dark");
         crate::database::validate_connection(&reopened).unwrap();
@@ -2165,7 +3653,9 @@ mod tests {
                 price_insert
                     .execute(params![
                         format!("price-{index}"),
-                        format!("point-{index:05}")
+                        (NaiveDate::from_ymd_opt(1900, 1, 1).unwrap() + Duration::days(index))
+                            .format("%Y-%m-%d")
+                            .to_string()
                     ])
                     .unwrap();
             }

@@ -2,7 +2,7 @@
 use crate::error::{CommandError, CommandResult};
 use serde::Serialize;
 use std::{
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -33,10 +33,12 @@ struct Policy {
     timeout: Option<Duration>,
     last_activity: Instant,
     reason: Option<String>,
+    cancellation: Arc<crate::cancellation::Cancellation>,
 }
 
 impl Policy {
     fn revoke(&mut self, reason: &str) {
+        self.cancellation.cancel();
         self.epoch += 1;
         self.active = false;
         self.reason = Some(reason.into());
@@ -72,6 +74,7 @@ impl SessionPolicy {
             timeout: Some(Duration::from_secs(15 * 60)),
             last_activity: Instant::now(),
             reason: None,
+            cancellation: Arc::default(),
         }))
     }
 
@@ -104,6 +107,8 @@ impl SessionPolicy {
         }
         policy.epoch += 1;
         policy.active = true;
+        policy.cancellation.cancel();
+        policy.cancellation = Arc::default();
         policy.reason = None;
         policy.last_activity = now;
         policy.timeout = timeout;
@@ -124,6 +129,18 @@ impl SessionPolicy {
             return Err(CommandError::locked());
         }
         Ok(())
+    }
+
+    pub(crate) fn cancellation(
+        &self,
+        epoch: u64,
+    ) -> CommandResult<Arc<crate::cancellation::Cancellation>> {
+        let mut policy = self.policy();
+        policy.expire(Instant::now());
+        if !policy.active || policy.epoch != epoch {
+            return Err(CommandError::locked());
+        }
+        Ok(policy.cancellation.clone())
     }
 
     pub fn activity(&self) -> CommandResult<()> {

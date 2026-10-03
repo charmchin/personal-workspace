@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Cursor, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -8,7 +9,7 @@ use std::{
 };
 
 use age::{Decryptor, Encryptor, Identity, secrecy::SecretString};
-use chrono::{Datelike, Local, SecondsFormat, Utc};
+use chrono::{Datelike, SecondsFormat, Utc};
 use rand::RngCore;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use security_framework::{
@@ -32,27 +33,49 @@ const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
 const KEYCHAIN_MODE_FILE: &str = "keychain-mode-login";
 const PASSWORD_KEY_FILE: &str = "database-key.age";
 const LOCAL_PASSWORD_MIN_CHARS: usize = 6;
-const LATEST_SCHEMA_VERSION: i64 = 1;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 2;
+const BUSINESS_TABLES: &[&str] = &[
+    "tasks",
+    "calendar_items",
+    "projects",
+    "work_logs",
+    "goals",
+    "habits",
+    "habit_checks",
+    "learning_items",
+    "content_items",
+    "content_metrics",
+    "investment_accounts",
+    "instruments",
+    "portfolio_transactions",
+    "price_points",
+    "review_snapshots",
+];
 
 pub struct RuntimeState {
     pub connection: Option<Connection>,
     pub key: Option<Zeroizing<Vec<u8>>>,
     pub snapshot_warning: Option<String>,
     pub recovery_notice: Option<String>,
+    pub(crate) snapshot_stamp: Option<(std::time::Instant, u64, chrono::NaiveDate)>,
 }
 
 pub struct AppState {
     pub runtime: Mutex<RuntimeState>,
+    authentication: Mutex<()>,
     pub data_dir: PathBuf,
     pub database_path: PathBuf,
     pub backup_dir: PathBuf,
     pub(crate) session: crate::session::SessionPolicy,
+    pub(crate) quotes: crate::quotes::QuoteControl,
     pub(crate) stopping: AtomicBool,
+    _instance: crate::instance::InstanceLease,
 }
 
 impl AppState {
     pub fn new(data_dir: PathBuf) -> CommandResult<Self> {
         fs::create_dir_all(&data_dir)?;
+        let instance = crate::instance::InstanceLease::acquire(&data_dir)?;
         fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
         let backup_dir = data_dir.join("backups");
         fs::create_dir_all(&backup_dir)?;
@@ -70,16 +93,20 @@ impl AppState {
         prune_snapshots(&backup_dir, "pre-restore-", 5)?;
         prune_snapshots(&backup_dir, "pre-migration-", 5)?;
         Ok(Self {
+            _instance: instance,
             database_path,
             data_dir,
             backup_dir,
             session: crate::session::SessionPolicy::new(),
+            quotes: crate::quotes::QuoteControl::default(),
             stopping: AtomicBool::new(false),
+            authentication: Mutex::new(()),
             runtime: Mutex::new(RuntimeState {
                 connection: None,
                 key: None,
                 snapshot_warning: None,
                 recovery_notice: None,
+                snapshot_stamp: None,
             }),
         })
     }
@@ -101,7 +128,8 @@ impl AppState {
     fn status_for_runtime(&self, runtime: &RuntimeState) -> SecurityStatus {
         let session = self.session.snapshot();
         SecurityStatus {
-            initialized: self.has_existing_database(),
+            initialized: self.has_existing_database()
+                || self.data_dir.join(PASSWORD_KEY_FILE).exists(),
             unlocked: runtime.connection.is_some() && session.unlocked,
             database_path: self.database_path.to_string_lossy().to_string(),
             keychain_mode: self.keychain_mode(),
@@ -127,7 +155,15 @@ impl AppState {
         }
     }
 
+    fn authentication_guard(&self) -> CommandResult<std::sync::MutexGuard<'_, ()>> {
+        self.authentication.try_lock().map_err(|_| {
+            CommandError::new("AUTHENTICATION_IN_PROGRESS", "另一项认证操作尚未结束")
+                .with_recovery("请等待当前解锁或口令修改完成后再试。")
+        })
+    }
+
     pub fn unlock(&self) -> CommandResult<SecurityStatus> {
+        let _authentication = self.authentication_guard()?;
         let ticket = self.session.challenge()?;
         if self.data_dir.join(PASSWORD_KEY_FILE).exists() {
             return Err(CommandError::new(
@@ -193,6 +229,7 @@ impl AppState {
     }
 
     pub fn initialize_with_password(&self, password: &str) -> CommandResult<SecurityStatus> {
+        let _authentication = self.authentication_guard()?;
         let ticket = self.session.challenge()?;
         if self.has_existing_database() {
             return Err(CommandError::new(
@@ -200,13 +237,23 @@ impl AppState {
                 "工作台已经初始化，不能重新生成数据库密钥",
             ));
         }
-        let mut key = vec![0_u8; 32];
-        rand::rng().fill_bytes(&mut key);
+        if fs::symlink_metadata(self.data_dir.join(PASSWORD_KEY_FILE)).is_ok() {
+            return Err(CommandError::new(
+                "LOCAL_KEY_ALREADY_EXISTS",
+                "已存在口令保护的数据库密钥，不能重新生成",
+            )
+            .with_recovery(
+                "请取消初始化并用原工作台口令解锁，继续完成未结束的初始化；不要删除密钥文件。",
+            ));
+        }
+        let mut key = Zeroizing::new(vec![0_u8; 32]);
+        rand::rng().fill_bytes(key.as_mut_slice());
         store_password_protected_key(&self.data_dir, &key, password)?;
-        self.open_with_key(key, ticket)
+        self.open_with_key(key.to_vec(), ticket)
     }
 
     pub fn unlock_with_password(&self, password: &str) -> CommandResult<SecurityStatus> {
+        let _authentication = self.authentication_guard()?;
         let ticket = self.session.challenge()?;
         let key = read_password_protected_key(&self.data_dir, password)?;
         self.open_with_key(key, ticket)
@@ -217,6 +264,7 @@ impl AppState {
         current_password: &str,
         new_password: &str,
     ) -> CommandResult<SecurityStatus> {
+        let _authentication = self.authentication_guard()?;
         let epoch = self.session.require_active()?;
         validate_local_password(current_password)?;
         validate_local_password(new_password)?;
@@ -323,6 +371,7 @@ impl AppState {
     }
 
     fn close_runtime(runtime: &mut RuntimeState) {
+        runtime.snapshot_stamp = None;
         runtime.key = None;
         runtime.connection = None;
     }
@@ -333,6 +382,56 @@ impl AppState {
         {
             Self::close_runtime(&mut runtime);
         }
+    }
+
+    /// Nonblocking acquisition: snapshot work must never delay revoking a session.
+    /// Errors are reported in SecurityStatus and do not undo successful business writes.
+    pub(crate) fn refresh_snapshot_if_due(&self, force: bool) -> CommandResult<bool> {
+        let Ok(mut runtime) = self.runtime.try_lock() else {
+            return Ok(false);
+        };
+        if !force && !self.session.snapshot().unlocked {
+            return Ok(false);
+        }
+        let (Some(connection), Some(key)) = (&runtime.connection, &runtime.key) else {
+            return Ok(false);
+        };
+        let now = Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("fixed offset"));
+        let changes = connection.total_changes();
+        if let Some((at, previous, day)) = runtime.snapshot_stamp
+            && day == now.date_naive()
+            && (previous == changes
+                || (!force && at.elapsed() < std::time::Duration::from_secs(300)))
+        {
+            return Ok(false);
+        }
+        let result = (|| {
+            create_automatic_snapshots(connection, key, &self.backup_dir)?;
+            let name = format!(
+                "latest-{}-{}.sqlite3",
+                Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+                uuid::Uuid::now_v7()
+            );
+            create_encrypted_snapshot(connection, key, &self.backup_dir.join(name))?;
+            prune_snapshots(&self.backup_dir, "latest-", 3)?;
+            Ok(())
+        })();
+        // Throttle failures as well; a full disk must not trigger a busy retry loop.
+        let saved_changes = if result.is_ok() {
+            runtime
+                .connection
+                .as_ref()
+                .map_or(changes, Connection::total_changes)
+        } else {
+            u64::MAX
+        };
+        runtime.snapshot_stamp = Some((std::time::Instant::now(), saved_changes, now.date_naive()));
+        runtime.snapshot_warning = result
+            .as_ref()
+            .err()
+            .map(|error: &CommandError| format!("最近恢复点未能完成：{}", error.message));
+        result.map(|()| true)
     }
 
     pub fn with_connection<T>(
@@ -503,10 +602,7 @@ fn read_password_protected_key_file(path: &Path, password: &str) -> CommandResul
     let identity = age::scrypt::Identity::new(SecretString::from(password.to_owned()));
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn Identity))
-        .map_err(|_| {
-            CommandError::new("LOCAL_PASSWORD_INCORRECT", "工作台口令错误")
-                .with_recovery("当前数据库未被修改，请检查口令后重试。")
-        })?;
+        .map_err(local_key_decryption_error)?;
     let mut key = Vec::with_capacity(32);
     reader.read_to_end(&mut key)?;
     if key.len() != 32 {
@@ -516,6 +612,15 @@ fn read_password_protected_key_file(path: &Path, password: &str) -> CommandResul
         ));
     }
     Ok(key)
+}
+
+fn local_key_decryption_error(error: age::DecryptError) -> CommandError {
+    if matches!(error, age::DecryptError::ExcessiveWork { .. }) {
+        return CommandError::new("LOCAL_KEY_RESOURCE_LIMIT", "本地密钥解密成本超过当前设备的安全限制")
+            .with_recovery("这不表示口令错误。密钥和数据库未被修改，请关闭高负载程序后重试；若持续出现，请保留原密钥文件并联系维护者，不要重新初始化。");
+    }
+    CommandError::new("LOCAL_PASSWORD_INCORRECT", "工作台口令错误")
+        .with_recovery("当前数据库未被修改，请检查口令后重试。")
 }
 
 pub fn set_tushare_token(token: &str) -> CommandResult<()> {
@@ -582,13 +687,17 @@ pub(crate) fn open_cipher_connection_read_only(
 }
 
 fn configure_cipher_connection(connection: Connection, key: &[u8]) -> CommandResult<Connection> {
-    let key_hex = hex::encode(key);
-    connection.execute_batch(&format!(
+    let key_hex = Zeroizing::new(hex::encode(key));
+    let key_sql = Zeroizing::new(format!(
         "PRAGMA key = \"x'{key_hex}'\";\
          PRAGMA cipher_memory_security = ON;\
          PRAGMA foreign_keys = ON;\
-         PRAGMA busy_timeout = 5000;"
-    ))?;
+         PRAGMA busy_timeout = 5000;",
+        key_hex = key_hex.as_str()
+    ));
+    connection.execute_batch(&key_sql)?;
+    drop(key_sql);
+    drop(key_hex);
 
     let cipher_version: Option<String> = connection
         .query_row("PRAGMA cipher_version", [], |row| row.get(0))
@@ -649,7 +758,7 @@ fn finish_open_database(connection: Connection, path: &Path) -> CommandResult<Co
     Ok(connection)
 }
 
-fn schema_version(connection: &Connection) -> CommandResult<i64> {
+pub(crate) fn schema_version(connection: &Connection) -> CommandResult<i64> {
     let exists: i64 = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
         [],
@@ -692,7 +801,20 @@ fn restrict_database_permissions(path: &Path) -> CommandResult<()> {
     Ok(())
 }
 
-fn run_migrations(connection: &Connection) -> CommandResult<()> {
+pub(crate) fn run_migrations(connection: &Connection) -> CommandResult<()> {
+    if schema_version(connection)? > LATEST_SCHEMA_VERSION {
+        return Err(schema_error());
+    }
+    run_base_migration(connection)?;
+    if schema_version(connection)? < 2 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch("ALTER TABLE work_logs ADD COLUMN task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL; CREATE INDEX idx_work_logs_task ON work_logs(task_id); INSERT INTO schema_migrations(version,applied_at) VALUES(2,strftime('%Y-%m-%dT%H:%M:%fZ','now'));")?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn run_base_migration(connection: &Connection) -> CommandResult<()> {
     connection.execute_batch(
         r#"
         BEGIN IMMEDIATE;
@@ -978,7 +1100,8 @@ fn create_automatic_snapshots(
     key: &[u8],
     backup_dir: &Path,
 ) -> CommandResult<()> {
-    let now = Local::now();
+    let now =
+        Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("fixed offset"));
     let day_name = format!("daily-{}.sqlite3", now.format("%Y-%m-%d"));
     create_encrypted_snapshot(connection, key, &backup_dir.join(day_name))?;
 
@@ -996,28 +1119,39 @@ pub fn create_encrypted_snapshot(
     key: &[u8],
     destination: &Path,
 ) -> CommandResult<()> {
-    if destination.exists() {
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(CommandError::new(
+                "SNAPSHOT_PATH_INVALID",
+                "快照目标不是普通文件",
+            ));
+        }
         restrict_file_permissions(destination)?;
         return Ok(());
     }
-    let temporary = destination.with_extension("tmp");
-    if temporary.exists() {
-        fs::remove_file(&temporary)?;
-    }
-    export_encrypted_copy(source, key, &temporary)?;
-    let target = open_cipher_connection(&temporary, key)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| CommandError::new("SNAPSHOT_PATH_INVALID", "快照目录无效"))?;
+    let temporary_file = tempfile::Builder::new()
+        .prefix(".snapshot-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    let temporary = temporary_file.path();
+    export_encrypted_copy(source, key, temporary)?;
+    let target = open_cipher_connection(temporary, key)?;
     let integrity: String = target.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         drop(target);
-        let _ = fs::remove_file(&temporary);
         return Err(CommandError::new(
             "SNAPSHOT_INTEGRITY_FAILED",
             "自动快照完整性检查失败",
         ));
     }
     drop(target);
+    fs::File::open(temporary)?.sync_all()?;
     fs::rename(temporary, destination)?;
     restrict_file_permissions(destination)?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -1030,12 +1164,18 @@ pub(crate) fn export_encrypted_copy(
         fs::remove_file(destination)?;
     }
     let escaped_path = destination.to_string_lossy().replace('\'', "''");
-    let key_hex = hex::encode(key);
-    source.execute_batch(&format!(
-        "ATTACH DATABASE '{escaped_path}' AS workbench_export KEY \"x'{key_hex}'\";\
-         SELECT sqlcipher_export('workbench_export');\
-         DETACH DATABASE workbench_export;"
-    ))?;
+    let key_hex = Zeroizing::new(hex::encode(key));
+    let key_sql = Zeroizing::new(format!(
+        "ATTACH DATABASE '{escaped_path}' AS workbench_export KEY \"x'{key_hex}'\";",
+        key_hex = key_hex.as_str()
+    ));
+    source.execute_batch(&key_sql)?;
+    drop(key_sql);
+    drop(key_hex);
+    let copied = source.execute_batch("SELECT sqlcipher_export('workbench_export');");
+    let detached = source.execute_batch("DETACH DATABASE workbench_export;");
+    copied?;
+    detached?;
     restrict_file_permissions(destination)?;
     Ok(())
 }
@@ -1064,30 +1204,102 @@ pub(crate) fn prune_snapshots(directory: &Path, prefix: &str, keep: usize) -> Co
 }
 
 pub fn database_record_count(connection: &Connection) -> CommandResult<i64> {
-    let tables = [
-        "tasks",
-        "calendar_items",
-        "projects",
-        "work_logs",
-        "goals",
-        "habits",
-        "habit_checks",
-        "learning_items",
-        "content_items",
-        "content_metrics",
-        "investment_accounts",
-        "instruments",
-        "portfolio_transactions",
-        "price_points",
-        "review_snapshots",
-    ];
+    let counts = database_table_counts(connection)?;
     let mut total = 0_i64;
-    for table in tables {
-        total += connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-            row.get::<_, i64>(0)
+    for table in BUSINESS_TABLES {
+        total = total.checked_add(counts[*table]).ok_or_else(|| {
+            CommandError::new("BACKUP_COUNT_INVALID", "数据库记录数超过可校验范围")
         })?;
     }
     Ok(total)
+}
+
+pub(crate) fn database_table_counts(
+    connection: &Connection,
+) -> CommandResult<BTreeMap<String, i64>> {
+    let mut counts = BTreeMap::new();
+    for table in BUSINESS_TABLES
+        .iter()
+        .copied()
+        .chain(["settings", "schema_migrations"])
+    {
+        // Table names come only from the compiled schema allowlist.
+        let count = connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        counts.insert(table.to_owned(), count);
+    }
+    Ok(counts)
+}
+
+type ColumnDefinition = (String, String, i64, Option<String>, i64);
+type ForeignKeyDefinition = (String, String, Option<String>, String, String, String);
+
+#[derive(Debug, PartialEq, Eq)]
+struct TableDefinition {
+    columns: Vec<ColumnDefinition>,
+    foreign_keys: Vec<ForeignKeyDefinition>,
+    unique_keys: Vec<Vec<String>>,
+}
+
+fn table_definition(connection: &Connection, table: &str) -> CommandResult<TableDefinition> {
+    let mut statement = connection.prepare(
+        "SELECT name,type,\"notnull\",dflt_value,pk FROM pragma_table_info(?1) ORDER BY cid",
+    )?;
+    let columns = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<ColumnDefinition>, _>>()?;
+    let mut statement = connection.prepare("SELECT \"table\",\"from\",\"to\",on_update,on_delete,\"match\" FROM pragma_foreign_key_list(?1) ORDER BY \"table\",\"from\",\"to\",seq")?;
+    let foreign_keys = statement
+        .query_map([table], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<ForeignKeyDefinition>, _>>()?;
+    let mut statement =
+        connection.prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\"=1")?;
+    let indexes = statement
+        .query_map([table], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut unique_keys = Vec::new();
+    for name in indexes {
+        // Index names are database-controlled; bind them instead of interpolating SQL.
+        let mut statement =
+            connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+        unique_keys.push(
+            statement
+                .query_map([name], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    unique_keys.sort();
+    Ok(TableDefinition {
+        columns,
+        foreign_keys,
+        unique_keys,
+    })
+}
+
+fn schema_error() -> CommandError {
+    CommandError::new(
+        "BACKUP_SCHEMA_INVALID",
+        "数据库结构与当前支持的工作台版本不一致，已拒绝恢复",
+    )
+    .with_recovery("请使用结构完整的工作台备份；不要删除当前数据库或手工修改备份版本。")
 }
 
 pub fn validate_connection(connection: &Connection) -> CommandResult<()> {
@@ -1098,17 +1310,87 @@ pub fn validate_connection(connection: &Connection) -> CommandResult<()> {
             format!("数据库完整性检查未通过：{integrity}"),
         ));
     }
-    let version: Option<i64> = connection
-        .query_row("SELECT max(version) FROM schema_migrations", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })
-        .optional()?
-        .flatten();
-    if version.unwrap_or(0) < 1 {
+    // Build the expected structure on a separate in-memory connection, never
+    // run migrations on an untrusted candidate to make a damaged backup pass.
+    let version = schema_version(connection)?;
+    if !(1..=LATEST_SCHEMA_VERSION).contains(&version) {
         return Err(CommandError::new(
             "BACKUP_VERSION_UNSUPPORTED",
-            "备份数据库缺少受支持的结构版本",
+            "数据库结构版本不受当前工作台支持",
         ));
+    }
+    let reference = Connection::open_in_memory()?;
+    if version == 1 {
+        run_base_migration(&reference)?;
+    } else {
+        run_migrations(&reference)?;
+    }
+    let mut statement = connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND substr(name,1,7)<>'sqlite_' ORDER BY name")?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut expected: Vec<String> = BUSINESS_TABLES
+        .iter()
+        .copied()
+        .chain(["settings", "schema_migrations"])
+        .map(str::to_owned)
+        .collect();
+    expected.sort();
+    if tables != expected {
+        return Err(schema_error());
+    }
+    for table in BUSINESS_TABLES
+        .iter()
+        .copied()
+        .chain(["settings", "schema_migrations"])
+    {
+        let ordinary: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !ordinary
+            || table_definition(connection, table).map_err(|_| schema_error())?
+                != table_definition(&reference, table)?
+        {
+            return Err(schema_error());
+        }
+    }
+    let unsafe_schema: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if unsafe_schema {
+        return Err(schema_error());
+    }
+    let mut statement =
+        connection.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+    let versions = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if versions != (1..=version).collect::<Vec<_>>() {
+        return Err(CommandError::new(
+            "BACKUP_VERSION_UNSUPPORTED",
+            "数据库结构版本缺失或不受当前工作台支持，已拒绝恢复",
+        )
+        .with_recovery("请使用兼容版本的应用读取备份；不要手工降低数据库版本号。"));
+    }
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        return Err(CommandError::new(
+            "BACKUP_FOREIGN_KEY_INVALID",
+            "数据库包含无效的跨模块关联，已拒绝恢复",
+        )
+        .with_recovery(
+            "当前数据库未被替换，请选择关联完整的备份；不要手工删除关联记录来绕过校验。",
+        ));
+    }
+    let valid_settings: i64 = connection.query_row("SELECT count(*) FROM settings WHERE id=1 AND theme IN ('light','dark','system') AND lock_minutes IN (0,5,15,30) AND amounts_hidden IN (0,1) AND quote_enabled IN (0,1) AND quote_auto_refresh IN (0,1) AND timezone='Asia/Shanghai' AND currency='CNY'", [], |row| row.get(0))?;
+    let settings_count: i64 =
+        connection.query_row("SELECT count(*) FROM settings", [], |row| row.get(0))?;
+    if settings_count != 1 || valid_settings != 1 {
+        return Err(schema_error());
     }
     Ok(())
 }
@@ -1116,6 +1398,275 @@ pub fn validate_connection(connection: &Connection) -> CommandResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_snapshots_capture_later_writes_are_throttled_and_keep_three() {
+        let (_directory, state) = unlocked_fixture();
+        assert!(state.refresh_snapshot_if_due(false).unwrap());
+        let names = || {
+            crate::backup::list_backups(&state)
+                .unwrap()
+                .into_iter()
+                .filter(|backup| backup.kind == "latest")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names().len(), 1);
+        // sqlcipher_export can increase total_changes: snapshot completion must
+        // record the post-export counter, otherwise idle use makes endless copies.
+        assert!(!state.refresh_snapshot_if_due(false).unwrap());
+        for index in 0..5 {
+            state.with_connection(|connection| {
+                connection.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES(?1,?1,'work','active','#397064','','2026-10-03T00:00:00Z','2026-10-03T00:00:00Z')", [format!("later-{index}")])?;
+                Ok(())
+            }).unwrap();
+            assert!(!state.refresh_snapshot_if_due(false).unwrap());
+            assert!(state.refresh_snapshot_if_due(true).unwrap());
+        }
+        let latest = names();
+        assert_eq!(latest.len(), 3);
+        let newest =
+            open_cipher_connection(&state.backup_dir.join(&latest[0].name), &[71; 32]).unwrap();
+        assert_eq!(
+            newest
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        assert!(!state.refresh_snapshot_if_due(true).unwrap());
+        state.lock();
+        assert!(!state.refresh_snapshot_if_due(false).unwrap());
+        assert!(fs::read_dir(&state.backup_dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn snapshot_failure_is_reported_and_throttled_without_changing_business_data() {
+        let (_directory, state) = unlocked_fixture();
+        fs::remove_dir(&state.backup_dir).unwrap();
+        fs::write(&state.backup_dir, b"not a directory").unwrap();
+        assert!(state.refresh_snapshot_if_due(false).is_err());
+        assert!(state.status().snapshot_warning.is_some());
+        assert!(!state.refresh_snapshot_if_due(false).unwrap());
+        state
+            .with_connection(|connection| {
+                assert!(crate::repository::list_projects(connection)?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        fs::remove_file(&state.backup_dir).unwrap();
+        fs::create_dir(&state.backup_dir).unwrap();
+        assert!(state.refresh_snapshot_if_due(true).unwrap());
+        assert!(state.status().snapshot_warning.is_none());
+    }
+
+    #[test]
+    fn backup_validation_rejects_orphaned_relations_even_with_foreign_keys_disabled() {
+        let (_directory, state) = unlocked_fixture();
+        let runtime = state.runtime.lock().unwrap();
+        let connection = runtime.connection.as_ref().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO habit_checks(id,habit_id,check_date) VALUES('orphan','missing','2026-10-03');").unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            validate_connection(connection).unwrap_err().code,
+            "BACKUP_FOREIGN_KEY_INVALID"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM habit_checks", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn backup_validation_rejects_future_and_incomplete_schema_versions() {
+        for change in [
+            "DELETE FROM schema_migrations",
+            "UPDATE schema_migrations SET version=999 WHERE version=2",
+            "INSERT INTO schema_migrations VALUES(0,'now')",
+        ] {
+            let (_directory, state) = unlocked_fixture();
+            let runtime = state.runtime.lock().unwrap();
+            let connection = runtime.connection.as_ref().unwrap();
+            connection.execute_batch(change).unwrap();
+            assert_eq!(
+                validate_connection(connection).unwrap_err().code,
+                "BACKUP_VERSION_UNSUPPORTED"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_validation_rejects_missing_structure_and_unsafe_settings_without_repair() {
+        for change in [
+            "DROP TABLE review_snapshots",
+            "ALTER TABLE projects DROP COLUMN notes",
+            "DROP TABLE habit_checks; CREATE TABLE habit_checks(id TEXT PRIMARY KEY,habit_id TEXT NOT NULL,check_date TEXT NOT NULL,value INTEGER NOT NULL DEFAULT 1,note TEXT NOT NULL DEFAULT '',UNIQUE(habit_id,check_date))",
+            "DROP TABLE projects; CREATE TABLE projects(id TEXT,name TEXT NOT NULL,area TEXT NOT NULL DEFAULT 'work',status TEXT NOT NULL DEFAULT 'active',color TEXT NOT NULL DEFAULT '#397064',notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+            "CREATE TRIGGER unexpected AFTER INSERT ON projects BEGIN DELETE FROM goals; END",
+            "UPDATE settings SET lock_minutes=999",
+            "DELETE FROM settings",
+        ] {
+            let (_directory, state) = unlocked_fixture();
+            let runtime = state.runtime.lock().unwrap();
+            let connection = runtime.connection.as_ref().unwrap();
+            connection.execute_batch(change).unwrap();
+            let before = connection.serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+            assert_eq!(
+                validate_connection(connection).unwrap_err().code,
+                "BACKUP_SCHEMA_INVALID",
+                "{change}"
+            );
+            assert_eq!(
+                connection.serialize(rusqlite::MAIN_DB).unwrap().to_vec(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_authentication_is_rejected_before_keys_or_files_are_accessed() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let guard = state.authentication.lock().unwrap();
+        for result in [
+            state.unlock(),
+            state.initialize_with_password("123456"),
+            state.unlock_with_password("123456"),
+            state.change_local_password("123456", "654321"),
+        ] {
+            assert_eq!(result.unwrap_err().code, "AUTHENTICATION_IN_PROGRESS");
+        }
+        assert!(!state.database_path.exists());
+        assert!(!state.data_dir.join(PASSWORD_KEY_FILE).exists());
+        drop(guard);
+        assert!(state.authentication_guard().is_ok());
+    }
+
+    #[test]
+    fn incomplete_initialization_preserves_existing_wrapped_key_and_can_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        let key = vec![91; 32];
+        store_password_protected_key(&state.data_dir, &key, "original-password").unwrap();
+        let before = fs::read(state.data_dir.join(PASSWORD_KEY_FILE)).unwrap();
+        assert_eq!(
+            state
+                .initialize_with_password("replacement-password")
+                .unwrap_err()
+                .code,
+            "LOCAL_KEY_ALREADY_EXISTS"
+        );
+        assert_eq!(
+            fs::read(state.data_dir.join(PASSWORD_KEY_FILE)).unwrap(),
+            before
+        );
+        assert!(!state.database_path.exists());
+        assert!(
+            state
+                .unlock_with_password("original-password")
+                .unwrap()
+                .unlocked
+        );
+        state.lock();
+        assert!(
+            state
+                .unlock_with_password("original-password")
+                .unwrap()
+                .unlocked
+        );
+    }
+
+    #[test]
+    fn deleting_old_data_and_snapshots_keeps_original_password_for_a_fresh_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path().to_owned()).unwrap();
+        state.initialize_with_password("original-password").unwrap();
+        state.with_connection(|connection| {
+            connection.execute("INSERT INTO projects(id,name,area,status,color,notes,created_at,updated_at) VALUES('old-test','旧测试数据','work','active','#000','','now','now')", [])?;
+            Ok(())
+        }).unwrap();
+        assert!(state.refresh_snapshot_if_due(true).unwrap());
+        let wrapped_key = fs::read(state.data_dir.join(PASSWORD_KEY_FILE)).unwrap();
+        state.lock();
+        drop(state);
+        for entry in fs::read_dir(directory.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == PASSWORD_KEY_FILE {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                fs::remove_dir_all(entry.path()).unwrap();
+            } else {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let fresh = AppState::new(directory.path().to_owned()).unwrap();
+        assert!(fresh.status().initialized);
+        assert_eq!(fresh.status().keychain_mode, "passphrase");
+        assert_eq!(
+            fresh
+                .unlock_with_password("incorrect-password")
+                .unwrap_err()
+                .code,
+            "LOCAL_PASSWORD_INCORRECT"
+        );
+        assert!(!fresh.database_path.exists());
+        assert!(
+            fresh
+                .unlock_with_password("original-password")
+                .unwrap()
+                .unlocked
+        );
+        fresh
+            .with_connection(|connection| {
+                for table in BUSINESS_TABLES {
+                    let count: i64 = connection.query_row(
+                        &format!("SELECT COUNT(*) FROM {table}"),
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(count, 0, "old records remained in {table}");
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(fresh.data_dir.join(PASSWORD_KEY_FILE)).unwrap(),
+            wrapped_key
+        );
+        for backup in crate::backup::list_backups(&fresh).unwrap() {
+            let key = read_password_protected_key(&fresh.data_dir, "original-password").unwrap();
+            let connection =
+                open_cipher_connection(&fresh.backup_dir.join(backup.name), &key).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM projects", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        fresh.lock();
+        assert!(
+            fresh
+                .unlock_with_password("original-password")
+                .unwrap()
+                .unlocked
+        );
+    }
 
     fn unlocked_fixture() -> (tempfile::TempDir, AppState) {
         let directory = tempfile::tempdir().unwrap();
@@ -1368,6 +1919,56 @@ mod tests {
     }
 
     #[test]
+    fn schema_one_migration_preserves_logs_and_valid_encrypted_recovery_point() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v1.sqlite3");
+        let backups = directory.path().join("backups");
+        fs::create_dir(&backups).unwrap();
+        let key = [44; 32];
+        let v1 = open_cipher_connection(&path, &key).unwrap();
+        run_base_migration(&v1).unwrap();
+        v1.execute_batch("INSERT INTO work_logs(id,log_date,title,markdown,minutes,created_at,updated_at) VALUES('old-log','2026-10-03','原记录','不丢失',60,'now','now');").unwrap();
+        assert_eq!(schema_version(&v1).unwrap(), 1);
+        drop(v1);
+        let migrated = open_database_with_migration_snapshot(&path, &key, &backups).unwrap();
+        assert_eq!(schema_version(&migrated).unwrap(), 2);
+        let logs = crate::repository::list_work_logs(&migrated).unwrap();
+        assert_eq!(logs[0].markdown, "不丢失");
+        assert_eq!(logs[0].minutes, 60);
+        assert!(logs[0].task_id.is_none());
+        let snapshot = fs::read_dir(&backups)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let old = open_cipher_connection(&snapshot, &key).unwrap();
+        assert_eq!(schema_version(&old).unwrap(), 1);
+        validate_connection(&old).unwrap();
+        assert!(
+            Connection::open(&snapshot)
+                .unwrap()
+                .query_row("SELECT title FROM work_logs", [], |r| r.get::<_, String>(0))
+                .is_err()
+        );
+        drop(migrated);
+        let reopened = open_database_with_migration_snapshot(&path, &key, &backups).unwrap();
+        assert_eq!(schema_version(&reopened).unwrap(), 2);
+        assert_eq!(fs::read_dir(&backups).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn schema_two_migration_rolls_back_if_index_creation_fails() {
+        let db = Connection::open_in_memory().unwrap();
+        run_base_migration(&db).unwrap();
+        db.execute_batch("CREATE INDEX idx_work_logs_task ON work_logs(title);")
+            .unwrap();
+        assert!(run_migrations(&db).is_err());
+        assert_eq!(schema_version(&db).unwrap(), 1);
+        assert!(db.prepare("SELECT task_id FROM work_logs").is_err());
+    }
+
+    #[test]
     fn password_protected_key_round_trip_rejects_wrong_password() {
         let directory = tempfile::tempdir().unwrap();
         let state = AppState::new(directory.path().join("private-data")).unwrap();
@@ -1473,4 +2074,16 @@ mod tests {
             .unlock_with_password("original horse battery staple")
             .unwrap();
     }
+}
+#[test]
+fn resource_limited_key_decryption_is_not_misreported_as_wrong_password() {
+    let limited = local_key_decryption_error(age::DecryptError::ExcessiveWork {
+        required: 18,
+        target: 10,
+    });
+    assert_eq!(limited.code, "LOCAL_KEY_RESOURCE_LIMIT");
+    assert_eq!(
+        local_key_decryption_error(age::DecryptError::DecryptionFailed).code,
+        "LOCAL_PASSWORD_INCORRECT"
+    );
 }

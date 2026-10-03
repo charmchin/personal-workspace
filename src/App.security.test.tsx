@@ -24,6 +24,25 @@ const base: SecurityStatus = { initialized: true, unlocked: true, databasePath: 
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 describe("原生锁定后的页面清理", () => {
+  it("连续 Enter 不会并发提交口令认证，失败后可以重试", async () => {
+    setup({ ...base, unlocked: false, sessionEpoch: 0 });
+    let reject!: (error: unknown) => void;
+    const pending = new Promise<SecurityStatus>((_done, fail) => { reject = fail; });
+    const initial = mocked.call.getMockImplementation()!;
+    mocked.call.mockImplementation((command, args) => command === "security_unlock_with_password" ? pending : initial(command, args));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "解锁工作台" }));
+    const password = screen.getByLabelText("工作台口令");
+    fireEvent.change(password, { target: { value: "123456" } });
+    fireEvent.keyDown(password, { key: "Enter" });
+    fireEvent.keyDown(password, { key: "Enter" });
+    expect(mocked.call.mock.calls.filter(([command]) => command === "security_unlock_with_password")).toHaveLength(1);
+    await act(async () => reject({ code: "TEST", message: "认证失败" }));
+    expect(screen.getByText("认证失败")).toBeTruthy();
+    fireEvent.keyDown(password, { key: "Enter" });
+    await waitFor(() => expect(mocked.call.mock.calls.filter(([command]) => command === "security_unlock_with_password")).toHaveLength(2));
+  });
+
   it("立即卸载私密模块，并拒绝随后返回的旧状态", async () => {
     setup(base);
     render(<App />);

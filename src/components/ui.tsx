@@ -1,9 +1,11 @@
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactElement, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
-import { cloneElement, isValidElement, useEffect, useId, useRef } from "react";
+import { cloneElement, createContext, isValidElement, useContext, useEffect, useId, useRef } from "react";
 import { AlertCircle, Inbox } from "lucide-react";
+const BusyContext = createContext(false);
 
 export function Button({ variant = "primary", size = "md", className = "", type = "button", ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger"; size?: "sm" | "md" }) {
-  return <button type={type} className={`button button-${variant} button-${size} ${className}`} {...props} />;
+  const busy = useContext(BusyContext);
+  return <button type={type} className={`button button-${variant} button-${size} ${className}`} {...props} disabled={busy || props.disabled} />;
 }
 
 export function IconButton({ label, className = "", children, type = "button", ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; children: ReactNode }) {
@@ -43,28 +45,30 @@ export function Select(props: SelectHTMLAttributes<HTMLSelectElement>) {
   return <select className="select" {...props} />;
 }
 
-export function Switch({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
-  return <button type="button" className={`switch ${checked ? "is-on" : ""}`} role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}><span /></button>;
+export function Switch({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
+  return <button type="button" disabled={disabled} className={`switch ${checked ? "is-on" : ""}`} role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}><span /></button>;
 }
 
-export function Modal({ open, onClose, title, description, children, footer, size = "md" }: { open: boolean; onClose: () => void; title: string; description?: string; children: ReactNode; footer?: ReactNode; size?: "sm" | "md" | "lg" }) {
+export function Modal({ open, onClose, title, description, children, footer, size = "md", busy = false, error }: { open: boolean; onClose: () => void; title: string; description?: string; children: ReactNode; footer?: ReactNode; size?: "sm" | "md" | "lg"; busy?: boolean; error?: { message: string; recovery?: string | null } | null }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   const descriptionId = useId();
+  const errorRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const dialog = ref.current;
     if (!dialog) return;
     if (open && !dialog.open) dialog.showModal();
     if (!open && dialog.open) dialog.close();
   }, [open]);
+  useEffect(() => { if (open && error) errorRef.current?.focus(); }, [error, open]);
   return (
-    <dialog ref={ref} className={`modal modal-${size}`} aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} onCancel={(event) => { event.preventDefault(); onClose(); }} onClick={(event) => { if (event.target === ref.current) onClose(); }}>
-      <div className="modal-panel">
-        <header className="modal-header"><div><h2 id={titleId}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div><IconButton label="关闭" onClick={onClose}>×</IconButton></header>
-        <div className="modal-body">{children}</div>
+    <BusyContext.Provider value={busy}><dialog ref={ref} className={`modal modal-${size}`} aria-busy={busy} aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }} onClick={(event) => { if (!busy && event.target === ref.current) onClose(); }}>
+      {open && <div className="modal-panel">
+        <header className="modal-header"><div><h2 id={titleId}>{title}</h2>{description && <p id={descriptionId}>{description}</p>}</div><IconButton label="关闭" onClick={onClose} disabled={busy}>×</IconButton></header>
+        <div className="modal-body">{error && <div className="modal-error" ref={errorRef} tabIndex={-1}><ErrorBanner message={error.message} recovery={error.recovery} /></div>}<fieldset className="modal-fields" disabled={busy}>{children}</fieldset>{busy && <small role="status">正在保存，请稍候…</small>}</div>
         {footer && <footer className="modal-footer">{footer}</footer>}
-      </div>
-    </dialog>
+      </div>}
+    </dialog></BusyContext.Provider>
   );
 }
 

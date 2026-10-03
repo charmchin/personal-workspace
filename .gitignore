@@ -13,17 +13,28 @@ dist-ssr
 *.local
 
 # Local secrets and personal runtime data must never be committed
+/.local-docs/
 .env
 .env.*
 !.env.example
 *.sqlite
+*.sqlite-*
+*.sqlite.*
 *.sqlite3
 *.sqlite3-*
 *.sqlite3.*
 *.db
 *.db-*
+*.db.*
 database-key.age
+*.age
+*.pem
+*.key
+*.p12
+*.pfx
 *.workbench-backup
+*.app/
+*.dmg
 
 # Editor directories and files
 .vscode/*

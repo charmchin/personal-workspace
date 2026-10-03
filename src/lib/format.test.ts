@@ -5,7 +5,7 @@ import { emptyTransaction } from "./defaults";
 describe("本地显示格式", () => {
   it("隐藏金额时不泄露数值", () => {
     expect(money("123456.78", true)).toBe("••••••");
-    expect(money("invalid")).toBe("¥0.00");
+    expect(money("invalid")).toBe("未知");
   });
 
   it("按中文格式显示金额和精度", () => {
@@ -20,9 +20,19 @@ describe("本地显示格式", () => {
     expect(percent(130)).toBe("100%");
   });
 
+  it("超出浮点安全范围仍保留整数和分位，采用十进制舍入", () => {
+    expect(money("9007199254740993.125")).toBe("¥9,007,199,254,740,993.13");
+    expect(money("-1.005")).toBe("-¥1.01");
+    expect(number("9999999999999999.99995", 4)).toBe("10,000,000,000,000,000");
+    expect(money("0.004")).toBe("¥0.00");
+  });
+
   it("无效日期保留原始值，空日期明确显示", () => {
     expect(localDate(null)).toBe("未设置");
     expect(localDate("not-a-date")).toBe("not-a-date");
+    expect(localDate("2026-08-29T16:30:00Z", "yyyy-MM-dd HH:mm")).toBe("2026-08-30 00:30");
+    expect(localDate("2026-08-30T09:30", "HH:mm")).toBe("09:30");
+    expect(localDate("2026-08-30", "M月d日")).toBe("8月30日");
   });
 
   it("使用十进制字符串相乘，避免浮点误差", () => {

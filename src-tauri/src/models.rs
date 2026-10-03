@@ -96,6 +96,8 @@ pub struct Project {
 #[serde(rename_all = "camelCase")]
 pub struct WorkLog {
     pub id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub log_date: String,
     pub project_id: Option<String>,
     pub title: String,
@@ -258,6 +260,8 @@ pub struct PortfolioSnapshot {
     pub realized_gain: String,
     pub holdings: Vec<Holding>,
     pub updated_at: Option<String>,
+    pub valuation_complete: bool,
+    pub missing_price_count: usize,
 }
 
 impl Default for PortfolioSnapshot {
@@ -269,6 +273,8 @@ impl Default for PortfolioSnapshot {
             realized_gain: "0".into(),
             holdings: vec![],
             updated_at: None,
+            valuation_complete: true,
+            missing_price_count: 0,
         }
     }
 }
@@ -299,8 +305,11 @@ pub struct ReviewSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dashboard {
+    pub portfolio_error: Option<String>,
     pub date: String,
     pub tasks: Vec<Task>,
+    pub pending_task_count: usize,
+    pub completed_task_count: usize,
     pub next_event: Option<CalendarItem>,
     pub habits: Vec<Habit>,
     pub work_logs: Vec<WorkLog>,
@@ -343,6 +352,10 @@ pub struct BackupManifest {
     pub created_at: String,
     pub app_version: String,
     pub record_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_record_counts: Option<std::collections::BTreeMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

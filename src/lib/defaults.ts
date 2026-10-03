@@ -1,4 +1,4 @@
-import { format } from "date-fns";
+import { shanghaiInput, shanghaiToday } from "./calendar";
 import type {
   AppSettings,
   CalendarItem,
@@ -15,8 +15,8 @@ import type {
   WorkLog,
 } from "../types";
 
-const today = () => format(new Date(), "yyyy-MM-dd");
-const nowLocal = () => format(new Date(), "yyyy-MM-dd'T'HH:mm");
+const today = shanghaiToday;
+const nowLocal = () => shanghaiInput(new Date().toISOString());
 
 export const defaultSettings: AppSettings = {
   theme: "system",
@@ -37,7 +37,7 @@ export const emptyTask = (): Task => ({
 
 export const emptyCalendar = (): CalendarItem => ({
   id: "", kind: "event", title: "", notes: "", startAt: nowLocal(),
-  endAt: format(new Date(Date.now() + 60 * 60 * 1000), "yyyy-MM-dd'T'HH:mm"),
+  endAt: shanghaiInput(new Date(Date.now() + 60 * 60 * 1000).toISOString()),
   allDay: false, recurrence: "none", source: "internal", externalUid: null,
   projectId: null, createdAt: "", updatedAt: "",
 });
@@ -47,8 +47,8 @@ export const emptyProject = (): Project => ({
 });
 
 export const emptyWorkLog = (): WorkLog => ({
-  id: "", logDate: today(), projectId: null, title: "", completed: "", blockers: "",
-  nextSteps: "", minutes: 60, energy: 3, markdown: "", attachmentPath: null, createdAt: "", updatedAt: "",
+  id: "", logDate: today(), projectId: null, taskId: null, title: "", completed: "", blockers: "",
+  nextSteps: "", minutes: 0, energy: 3, markdown: "", attachmentPath: null, createdAt: "", updatedAt: "",
 });
 
 export const emptyGoal = (): Goal => ({

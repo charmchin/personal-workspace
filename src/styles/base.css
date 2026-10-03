@@ -113,6 +113,8 @@ dialog.modal::backdrop { background: rgb(13 25 21 / 44%); backdrop-filter: blur(
 .modal-header h2 { margin: 0; font-size: 18px; }
 .modal-header p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .modal-body { min-height: 0; padding: 20px; overflow: auto; overscroll-behavior: contain; }
+.modal-fields { border: 0; margin: 0; padding: 0; min-width: 0; width: 100%; }
+.modal-error { margin-bottom: 16px; }
 .modal-footer { justify-content: flex-end; border-top: 1px solid var(--line); }
 .error-banner, .notice-banner { display: flex; align-items: flex-start; gap: 10px; padding: 11px 13px; border-radius: 10px; font-size: 13px; }
 .error-banner { color: var(--red); background: color-mix(in srgb, var(--red) 10%, var(--surface)); }

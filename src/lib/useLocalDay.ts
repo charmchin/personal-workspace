@@ -1,9 +1,5 @@
 import { useEffect, useState } from "react";
-import { format } from "date-fns";
-
-function currentLocalDay() {
-  return format(new Date(), "yyyy-MM-dd");
-}
+import { shanghaiToday as currentLocalDay } from "./calendar";
 
 export function useLocalDay() {
   const [day, setDay] = useState(currentLocalDay);

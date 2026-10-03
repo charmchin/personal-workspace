@@ -1,9 +1,12 @@
 mod backup;
+mod cancellation;
 mod commands;
 mod database;
 mod error;
+mod instance;
 mod models;
 mod native_lock;
+mod quotes;
 mod repository;
 mod restore;
 mod session;
@@ -14,17 +17,35 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                // A single-window workbench has no tray/background workflow.
+                // Exit through RunEvent::Exit so workers, keys and final snapshots close safely.
+                api.prevent_close();
+                window.app_handle().exit(0);
+            }
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir().map_err(|error| {
                 Box::<dyn std::error::Error>::from(format!("无法确定本地数据目录：{error}"))
             })?;
-            let state = database::AppState::new(data_dir)
-                .map_err(|error| Box::<dyn std::error::Error>::from(error.message))?;
+            let state = match database::AppState::new(data_dir) {
+                Ok(state) => state,
+                Err(error) if error.code == "APP_ALREADY_RUNNING" => {
+                    native_lock::request_focus();
+                    app.handle().exit(0);
+                    return Ok(());
+                }
+                Err(error) => return Err(Box::<dyn std::error::Error>::from(error.message)),
+            };
             app.manage(state);
             native_lock::install(app.handle()).map_err(std::io::Error::other)?;
-            app.manage(std::sync::Mutex::new(Some(native_lock::start_monitor(
-                app.handle(),
-            ))));
+            app.manage(std::sync::Mutex::new(vec![
+                native_lock::start_monitor(app.handle()),
+                native_lock::start_snapshot_monitor(app.handle()),
+            ]));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -45,6 +66,7 @@ pub fn run() {
             commands::upsert_project,
             commands::list_work_logs,
             commands::upsert_work_log,
+            commands::create_task_from_work_log,
             commands::list_goals,
             commands::upsert_goal,
             commands::list_habits,
@@ -68,6 +90,7 @@ pub fn run() {
             commands::generate_weekly_summary,
             commands::delete_record,
             commands::open_saved_file,
+            commands::open_license_notices,
             commands::search_records,
             commands::get_settings,
             commands::update_settings,
@@ -87,22 +110,33 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::Reopen { .. })
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 native_lock::remove();
-                let state = app.state::<database::AppState>();
-                state.session.revoke("shutdown");
+                let Some(state) = app.try_state::<database::AppState>() else {
+                    return;
+                };
                 state
                     .stopping
                     .store(true, std::sync::atomic::Ordering::Release);
-                let monitor = app.state::<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>();
-                if let Some(thread) = monitor
+                let monitor = app.state::<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>();
+                for thread in monitor
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
-                    .take()
+                    .drain(..)
                 {
                     thread.thread().unpark();
                     let _ = thread.join();
                 }
+                let _ = state.refresh_snapshot_if_due(true);
+                state.session.revoke("shutdown");
             }
         });
 }

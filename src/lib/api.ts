@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { CommandError } from "../types";
 import { ZodError } from "zod";
-import { validateCommandResponse } from "./schemas";
+import { validateCommandRequest, validateCommandResponse } from "./schemas";
 
 export class WorkbenchError extends Error {
   code: string;
@@ -34,6 +34,11 @@ function normalizeError(error: unknown): CommandError {
 
 export async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {
+    try { validateCommandRequest(command, args); }
+    catch (error) {
+      if (error instanceof ZodError) throw new WorkbenchError({ code: "VALIDATION_ERROR", message: error.issues[0]?.message ?? "填写的数据无效", recovery: "请检查表单；数据尚未发送到本地数据库。" });
+      throw error;
+    }
     const response = await invoke<unknown>(command, args);
     try {
       return validateCommandResponse(command, response) as T;

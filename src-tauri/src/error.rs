@@ -32,13 +32,14 @@ impl CommandError {
 
     pub fn locked() -> Self {
         Self::new("APP_LOCKED", "工作台已锁定")
-            .with_recovery("请使用 Touch ID 或系统密码重新解锁。")
+            .with_recovery("请使用工作台当前配置的认证方式重新解锁。")
     }
 }
 
 impl From<rusqlite::Error> for CommandError {
-    fn from(error: rusqlite::Error) -> Self {
-        Self::new("DATABASE_ERROR", format!("本地数据库操作失败：{error}"))
+    fn from(_error: rusqlite::Error) -> Self {
+        // SQLite errors can contain SQL, parameters or key-bearing statements.
+        Self::new("DATABASE_ERROR", "本地数据库操作未完成")
             .with_recovery("请重试；若问题持续，请先导出备份再检查数据完整性。")
     }
 }
@@ -63,3 +64,22 @@ impl From<csv::Error> for CommandError {
 }
 
 pub type CommandResult<T> = Result<T, CommandError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_errors_do_not_expose_sql_or_parameter_details() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let raw = connection
+            .execute_batch("invalid SQL 'synthetic-database-key-and-private-value'")
+            .unwrap_err();
+        let converted = CommandError::from(raw);
+        let serialized = serde_json::to_string(&converted).unwrap();
+        assert_eq!(converted.code, "DATABASE_ERROR");
+        assert!(!serialized.contains("synthetic"));
+        assert!(!serialized.contains("invalid SQL"));
+        assert!(converted.recovery.is_some());
+    }
+}

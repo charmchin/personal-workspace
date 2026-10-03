@@ -15,6 +15,19 @@ use std::{cell::RefCell, ptr::NonNull};
 use tauri::{Emitter, Manager};
 
 pub(crate) const LOCK_EVENT: &str = "workbench:locked";
+const FOCUS_EVENT: &str = "com.local.personalworkbench.focus-existing-window";
+
+pub(crate) fn request_focus() {
+    unsafe {
+        NSDistributedNotificationCenter::defaultCenter()
+            .postNotificationName_object_userInfo_deliverImmediately(
+                &NSString::from_str(FOCUS_EVENT),
+                None,
+                None,
+                true,
+            );
+    }
+}
 
 pub(crate) struct Observer {
     center: Retained<NSNotificationCenter>,
@@ -49,7 +62,20 @@ pub(crate) fn observe(
 pub(crate) fn install(app: &tauri::AppHandle) -> Result<(), &'static str> {
     let _main_thread = MainThreadMarker::new().ok_or("原生锁定监听必须在主线程启动")?;
     let handle = app.clone();
-    let observers = register_notifications(move |event| system_event(&handle, event));
+    let mut observers = register_notifications(move |event| system_event(&handle, event));
+    let handle = app.clone();
+    observers.push(observe(
+        NSDistributedNotificationCenter::defaultCenter().into_super(),
+        &NSString::from_str(FOCUS_EVENT),
+        move || {
+            // This untrusted notification can only show/focus a window, never unlock data.
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        },
+    ));
     OBSERVERS.with(|slot| *slot.borrow_mut() = observers);
     Ok(())
 }
@@ -133,6 +159,20 @@ pub(crate) fn start_monitor(app: &tauri::AppHandle) -> std::thread::JoinHandle<(
             }
             last_epoch = snapshot.session_epoch;
             std::thread::park_timeout(std::time::Duration::from_millis(250));
+        }
+    })
+}
+
+pub(crate) fn start_snapshot_monitor(app: &tauri::AppHandle) -> std::thread::JoinHandle<()> {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            let state = handle.state::<AppState>();
+            if state.stopping.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let _ = state.refresh_snapshot_if_due(false);
+            std::thread::park_timeout(std::time::Duration::from_secs(1));
         }
     })
 }

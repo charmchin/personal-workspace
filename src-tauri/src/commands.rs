@@ -7,11 +7,8 @@ use std::{
 
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use csv::StringRecord;
-use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use tauri::State;
+use tauri::{Manager, State};
 use uuid::Uuid;
 
 use crate::{
@@ -19,11 +16,62 @@ use crate::{
     database::{AppState, get_tushare_token, now_utc, set_tushare_token},
     error::{CommandError, CommandResult},
     models::*,
-    repository,
+    quotes, repository,
 };
 
 const MAX_ICS_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_CSV_BYTES: u64 = 50 * 1024 * 1024;
+
+fn legal_notice_path(resource_dir: &Path) -> CommandResult<PathBuf> {
+    let legal_dir = resource_dir.join("legal");
+    let notice_dir = legal_dir.join("third-party");
+    let path = notice_dir.join("NOTICES.txt");
+    let directory = fs::symlink_metadata(&legal_dir)?;
+    let notices = fs::symlink_metadata(&notice_dir)?;
+    let file = fs::symlink_metadata(&path)?;
+    if !directory.file_type().is_dir()
+        || !notices.file_type().is_dir()
+        || !file.file_type().is_file()
+    {
+        return Err(CommandError::new(
+            "INVALID_LICENSE_RESOURCE",
+            "第三方许可资源不是应用内的普通文件",
+        ));
+    }
+    let canonical_root = resource_dir.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(CommandError::new(
+            "INVALID_LICENSE_RESOURCE",
+            "第三方许可资源不在应用资源目录内",
+        ));
+    }
+    Ok(canonical_path)
+}
+
+#[tauri::command(async)]
+pub fn open_license_notices(app: tauri::AppHandle) -> CommandResult<()> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| CommandError::new("LICENSE_RESOURCE_UNAVAILABLE", error.to_string()))?;
+    let path = legal_notice_path(&resource_dir).map_err(|error| {
+        CommandError::new("LICENSE_RESOURCE_UNAVAILABLE", error.message)
+            .with_recovery("请确认使用包含 legal 资源的完整应用构建。")
+    })?;
+    let status = Command::new("/usr/bin/open")
+        .args(["-a", "TextEdit", "--"])
+        .arg(path)
+        .status()
+        .map_err(|error| CommandError::new("LICENSE_OPEN_FAILED", error.to_string()))?;
+    if !status.success() {
+        return Err(CommandError::new(
+            "LICENSE_OPEN_FAILED",
+            "无法使用文本编辑打开第三方许可声明",
+        ));
+    }
+    Ok(())
+}
 
 fn validate_input_file(path: &str, extension: &str, max_bytes: u64) -> CommandResult<()> {
     let candidate = Path::new(path);
@@ -152,6 +200,17 @@ pub fn list_work_logs(state: State<'_, AppState>) -> CommandResult<Vec<WorkLog>>
 #[tauri::command(async)]
 pub fn upsert_work_log(state: State<'_, AppState>, log: WorkLog) -> CommandResult<WorkLog> {
     state.with_connection(|connection| repository::upsert_work_log(connection, log))
+}
+
+#[tauri::command(async)]
+pub fn create_task_from_work_log(
+    state: State<'_, AppState>,
+    log_id: String,
+    task: Task,
+) -> CommandResult<Task> {
+    state.with_connection(|connection| {
+        repository::create_task_from_work_log(connection, &log_id, task)
+    })
 }
 
 #[tauri::command(async)]
@@ -359,10 +418,7 @@ pub fn update_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> CommandResult<AppSettings> {
-    let updated =
-        state.with_connection(|connection| repository::update_settings(connection, settings))?;
-    state.session.configure(updated.lock_minutes)?;
-    Ok(updated)
+    quotes::update_settings(&state, settings)
 }
 
 #[tauri::command(async)]
@@ -375,177 +431,11 @@ pub fn has_tushare_token() -> bool {
     get_tushare_token().is_ok()
 }
 
-#[derive(Debug, Deserialize)]
-struct TushareResponse {
-    code: i64,
-    msg: Option<String>,
-    data: Option<TushareData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TushareData {
-    fields: Vec<String>,
-    items: Vec<Vec<Value>>,
-}
-
-fn tushare_code(instrument: &Instrument) -> String {
-    let code = instrument.code.trim().to_uppercase();
-    if code.contains('.') {
-        return code;
-    }
-    let suffix = if code.starts_with('6') || code.starts_with('5') {
-        "SH"
-    } else if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') {
-        "BJ"
-    } else {
-        "SZ"
-    };
-    format!("{code}.{suffix}")
-}
-
-async fn fetch_tushare_price(
-    client: &Client,
-    token: &str,
-    instrument: &Instrument,
-) -> CommandResult<(String, String)> {
-    let (api_name, price_field, date_field) = match instrument.kind.as_str() {
-        "fund" => ("fund_nav", "unit_nav", "nav_date"),
-        "etf" => ("fund_daily", "close", "trade_date"),
-        _ => ("daily", "close", "trade_date"),
-    };
-    let end = Utc::now().format("%Y%m%d").to_string();
-    let start = (Utc::now() - Duration::days(14))
-        .format("%Y%m%d")
-        .to_string();
-    let response = client
-        .post("https://api.tushare.pro")
-        .json(&json!({
-            "api_name": api_name,
-            "token": token,
-            "params": {"ts_code": tushare_code(instrument), "start_date": start, "end_date": end},
-            "fields": format!("{date_field},{price_field}")
-        }))
-        .send()
-        .await
-        .map_err(|error| {
-            CommandError::new("QUOTE_NETWORK_ERROR", format!("行情网络请求失败：{error}"))
-                .with_recovery("已保留最近一次价格，可稍后重试或使用手工价格。")
-        })?;
-    if !response.status().is_success() {
-        return Err(CommandError::new(
-            "QUOTE_HTTP_ERROR",
-            format!("行情服务返回 HTTP {}", response.status()),
-        ));
-    }
-    let payload: TushareResponse = response.json().await.map_err(|error| {
-        CommandError::new("QUOTE_RESPONSE_ERROR", format!("行情响应格式无效：{error}"))
-    })?;
-    if payload.code != 0 {
-        return Err(CommandError::new(
-            "QUOTE_PROVIDER_ERROR",
-            payload
-                .msg
-                .unwrap_or_else(|| format!("Tushare 错误代码 {}", payload.code)),
-        ));
-    }
-    let data = payload.data.ok_or_else(|| {
-        CommandError::new("QUOTE_EMPTY", format!("{} 没有可用行情", instrument.code))
-    })?;
-    let date_index = data
-        .fields
-        .iter()
-        .position(|field| field == date_field)
-        .ok_or_else(|| CommandError::new("QUOTE_RESPONSE_ERROR", "行情缺少日期字段"))?;
-    let price_index = data
-        .fields
-        .iter()
-        .position(|field| field == price_field)
-        .ok_or_else(|| CommandError::new("QUOTE_RESPONSE_ERROR", "行情缺少价格字段"))?;
-    let mut values = data.items;
-    values.sort_by(|a, b| {
-        b.get(date_index)
-            .and_then(Value::as_str)
-            .cmp(&a.get(date_index).and_then(Value::as_str))
-    });
-    let row = values.first().ok_or_else(|| {
-        CommandError::new("QUOTE_EMPTY", format!("{} 没有可用行情", instrument.code))
-    })?;
-    let raw_date = row
-        .get(date_index)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let price = row
-        .get(price_index)
-        .and_then(|value| match value {
-            Value::Number(number) => Some(number.to_string()),
-            Value::String(value) => Some(value.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| CommandError::new("QUOTE_RESPONSE_ERROR", "行情价格字段无效"))?;
-    let date = NaiveDate::parse_from_str(raw_date, "%Y%m%d")
-        .map(|value| value.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|_| raw_date.to_owned());
-    Ok((date, price))
-}
-
 #[tauri::command]
 pub async fn refresh_tushare_quotes(
     state: State<'_, AppState>,
 ) -> CommandResult<QuoteRefreshReport> {
-    let epoch = state.session.require_active()?;
-    let token = get_tushare_token()?;
-    let (settings, instruments) = state.with_connection(|connection| {
-        Ok((
-            repository::settings(connection)?,
-            repository::list_instruments(connection)?,
-        ))
-    })?;
-    if !settings.quote_enabled {
-        return Err(CommandError::new("QUOTES_DISABLED", "联网行情尚未启用"));
-    }
-    let client = Client::builder()
-        .https_only(true)
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent("PersonalWorkbench/0.1")
-        .build()
-        .map_err(|error| CommandError::new("QUOTE_CLIENT_ERROR", error.to_string()))?;
-    let mut prices = vec![];
-    let mut errors = vec![];
-    for instrument in instruments
-        .into_iter()
-        .filter(|instrument| instrument.kind != "cash")
-        .take(100)
-    {
-        state.session.require_epoch(epoch)?;
-        match fetch_tushare_price(&client, &token, &instrument).await {
-            Ok((date, price)) => prices.push(PricePointInput {
-                instrument_id: instrument.id,
-                price_date: date,
-                price,
-                source: "tushare".into(),
-            }),
-            Err(error) => errors.push(format!("{}：{}", instrument.code, error.message)),
-        }
-        state.session.require_epoch(epoch)?;
-    }
-    let refreshed_at = now_utc();
-    let updated = prices.len();
-    state.with_connection(|connection| {
-        state.session.require_epoch(epoch)?;
-        for price in prices {
-            repository::upsert_price(connection, price)?;
-        }
-        let mut settings = repository::settings(connection)?;
-        settings.last_quote_refresh = Some(refreshed_at.clone());
-        repository::update_settings(connection, settings)?;
-        Ok(())
-    })?;
-    Ok(QuoteRefreshReport {
-        updated,
-        failed: errors.len(),
-        errors,
-        refreshed_at,
-    })
+    quotes::refresh_quotes(&state).await
 }
 
 fn csv_index(headers: &StringRecord, names: &[&str]) -> Option<usize> {
@@ -778,7 +668,7 @@ fn unfold_ics(input: &str) -> Vec<String> {
     for raw in input.replace("\r\n", "\n").lines() {
         if raw.starts_with(' ') || raw.starts_with('\t') {
             if let Some(last) = lines.last_mut() {
-                last.push_str(raw.trim_start());
+                last.push_str(&raw[1..]);
             }
         } else {
             lines.push(raw.to_owned());
@@ -787,14 +677,29 @@ fn unfold_ics(input: &str) -> Vec<String> {
     lines
 }
 fn unescape_ics(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            result.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => result.push('\n'),
+            Some(character @ ('\\' | ',' | ';')) => result.push(character),
+            Some(character) => {
+                result.push('\\');
+                result.push(character);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
 }
 fn escape_ics(value: &str) -> String {
     value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
         .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace(',', "\\,")
@@ -854,7 +759,15 @@ fn import_ics_text(
         if let Some(event) = current.as_mut()
             && let Some((key, value)) = line.split_once(':')
         {
-            let base = key.split(';').next().unwrap_or(key).to_owned();
+            let base = key.split(';').next().unwrap_or(key).to_uppercase();
+            for parameter in key.split(';').skip(1) {
+                if let Some((name, value)) = parameter.split_once('=') {
+                    event.insert(
+                        format!("{base}.{}", name.to_uppercase()),
+                        value.trim_matches('"').to_owned(),
+                    );
+                }
+            }
             event.insert(base, value.to_owned());
         }
     }
@@ -866,6 +779,43 @@ fn import_ics_text(
         errors: vec![],
     };
     for (index, event) in events.into_iter().enumerate() {
+        let supported_zone = ["DTSTART.TZID", "DTEND.TZID"].iter().all(|key| {
+            event
+                .get(*key)
+                .is_none_or(|zone| matches!(zone.as_str(), "Asia/Shanghai" | "UTC" | "Etc/UTC"))
+        });
+        let rule = event.get("RRULE").map(String::as_str).unwrap_or("");
+        let simple_rule = rule.is_empty()
+            || (rule
+                .split(';')
+                .filter(|part| part.starts_with("FREQ="))
+                .count()
+                == 1
+                && rule
+                    .split(';')
+                    .filter(|part| part.starts_with("INTERVAL="))
+                    .count()
+                    <= 1
+                && rule.split(';').all(|part| {
+                    matches!(
+                        part,
+                        "FREQ=DAILY" | "FREQ=WEEKLY" | "FREQ=MONTHLY" | "INTERVAL=1"
+                    )
+                }));
+        if !supported_zone
+            || !simple_rule
+            || ["EXDATE", "RDATE", "RECURRENCE-ID", "DURATION"]
+                .iter()
+                .any(|key| event.contains_key(*key))
+            || event.get("UID").is_none_or(|uid| uid.trim().is_empty())
+        {
+            report.skipped += 1;
+            report.errors.push(format!(
+                "第 {} 个事件包含未支持的时区、复杂重复/时长规则，或缺少 UID；未改写导入",
+                index + 1
+            ));
+            continue;
+        }
         let uid = event
             .get("UID")
             .cloned()
@@ -877,7 +827,16 @@ fn import_ics_text(
                 .push(format!("第 {} 个事件缺少开始时间", index + 1));
             continue;
         };
-        let (start, all_day) = match ics_datetime(start_raw) {
+        let start_raw = if event
+            .get("DTSTART.TZID")
+            .is_some_and(|zone| zone == "UTC" || zone == "Etc/UTC")
+            && !start_raw.ends_with('Z')
+        {
+            format!("{start_raw}Z")
+        } else {
+            start_raw.clone()
+        };
+        let (start, all_day) = match ics_datetime(&start_raw) {
             Ok(value) => value,
             Err(error) => {
                 report.skipped += 1;
@@ -888,9 +847,32 @@ fn import_ics_text(
             }
         };
         let end = if let Some(raw) = event.get("DTEND") {
-            ics_datetime(raw)
-                .map(|value| value.0)
-                .unwrap_or_else(|_| start.clone())
+            let raw = if event
+                .get("DTEND.TZID")
+                .is_some_and(|zone| zone == "UTC" || zone == "Etc/UTC")
+                && !raw.ends_with('Z')
+            {
+                format!("{raw}Z")
+            } else {
+                raw.clone()
+            };
+            match ics_datetime(&raw) {
+                Ok((end, end_all_day))
+                    if end_all_day == all_day
+                        && (!all_day || end > start)
+                        && DateTime::parse_from_rfc3339(&end).ok()
+                            >= DateTime::parse_from_rfc3339(&start).ok() =>
+                {
+                    end
+                }
+                _ => {
+                    report.skipped += 1;
+                    report
+                        .errors
+                        .push(format!("第 {} 个事件结束时间无效，未导入", index + 1));
+                    continue;
+                }
+            }
         } else if all_day {
             let next_day = NaiveDate::parse_from_str(&start[..10], "%Y-%m-%d")
                 .map_err(|_| CommandError::new("ICS_DATE_INVALID", "ICS 全天事件日期无效"))?
@@ -900,6 +882,14 @@ fn import_ics_text(
             DateTime::parse_from_rfc3339(&start)
                 .map(|value| (value + Duration::hours(1)).to_rfc3339())
                 .unwrap_or_else(|_| start.clone())
+        };
+        let (start, end) = if all_day {
+            (start, end)
+        } else {
+            (
+                repository::utc_datetime(&start, "ICS 开始时间")?,
+                repository::utc_datetime(&end, "ICS 结束时间")?,
+            )
         };
         let exists = transaction
             .query_row(
@@ -940,13 +930,15 @@ fn iso_to_ics(value: &str, all_day: bool) -> String {
     if all_day {
         return value.get(..10).unwrap_or(value).replace('-', "");
     }
-    DateTime::parse_from_rfc3339(value)
+    repository::utc_datetime(value, "日程时间")
+        .ok()
+        .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
         .map(|date| {
             date.with_timezone(&Utc)
                 .format("%Y%m%dT%H%M%SZ")
                 .to_string()
         })
-        .unwrap_or_else(|_| value.into())
+        .unwrap_or_else(|| value.into())
 }
 
 #[tauri::command(async)]
@@ -973,10 +965,12 @@ fn render_ics(items: &[CalendarItem]) -> String {
     );
     for item in items {
         output.push_str("BEGIN:VEVENT\r\n");
-        output.push_str(&format!(
-            "UID:{}@personal-workbench\r\n",
-            item.external_uid.as_deref().unwrap_or(&item.id)
-        ));
+        let uid = item
+            .external_uid
+            .clone()
+            .unwrap_or_else(|| format!("{}@personal-workbench", item.id))
+            .replace(['\r', '\n'], "");
+        output.push_str(&format!("UID:{uid}\r\n"));
         output.push_str(&format!(
             "DTSTAMP:{}\r\n",
             Utc::now().format("%Y%m%dT%H%M%SZ")
@@ -1011,7 +1005,21 @@ fn render_ics(items: &[CalendarItem]) -> String {
         output.push_str("END:VEVENT\r\n");
     }
     output.push_str("END:VCALENDAR\r\n");
-    output
+    // RFC 5545 folds at 75 octets without splitting UTF-8 characters.
+    let mut folded = String::new();
+    for line in output.split_terminator("\r\n") {
+        let mut width = 0;
+        for character in line.chars() {
+            if width + character.len_utf8() > 75 {
+                folded.push_str("\r\n ");
+                width = 1;
+            }
+            folded.push(character);
+            width += character.len_utf8();
+        }
+        folded.push_str("\r\n");
+    }
+    folded
 }
 
 #[tauri::command(async)]
@@ -1049,12 +1057,110 @@ pub fn restore_snapshot(state: State<'_, AppState>, name: String) -> CommandResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ics_unsupported_rules_timezones_and_invalid_end_are_skipped_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut connection =
+            crate::database::open_database(&directory.path().join("ics.sqlite3"), &[40; 32])
+                .unwrap();
+        for properties in [
+            "DTSTART;TZID=America/New_York:20260829T090000",
+            "DTSTART:20260829T090000\r\nRRULE:FREQ=DAILY;COUNT=2",
+            "DTSTART:20260829T090000\r\nRRULE:INTERVAL=1",
+            "DTSTART:20260829T090000\r\nRRULE:FREQ=DAILY;FREQ=WEEKLY",
+            "DTSTART:20260829T090000\r\nDTEND:bad",
+            "DTSTART;VALUE=DATE:20260829\r\nDTEND;VALUE=DATE:20260829",
+            "DTSTART:20260829T090000\r\nEXDATE:20260830T090000",
+        ] {
+            let input = format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nSUMMARY:测试\r\n{properties}\r\nEND:VEVENT\r\nEND:VCALENDAR"
+            );
+            let report = import_ics_text(&mut connection, &input, "test").unwrap();
+            assert_eq!(report.skipped, 1, "{properties}");
+            assert!(!report.errors.is_empty());
+        }
+        assert!(
+            repository::list_calendar(&connection, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_ics_export_import_preserves_instant_uid_and_utf8_folding() {
+        assert_eq!(iso_to_ics("2026-08-29T09:00", false), "20260829T010000Z");
+        let directory = tempfile::tempdir().unwrap();
+        let mut connection =
+            crate::database::open_database(&directory.path().join("roundtrip.sqlite3"), &[41; 32])
+                .unwrap();
+        let title = "日程中文长标题 ".repeat(20);
+        let input = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:stable-id\r\nDTSTART;TZID=Asia/Shanghai:20260829T090000\r\nDTEND;TZID=Asia/Shanghai:20260829T100000\r\nSUMMARY:{title}\r\nEND:VEVENT\r\nEND:VCALENDAR"
+        );
+        assert_eq!(
+            import_ics_text(&mut connection, &input, "test")
+                .unwrap()
+                .imported,
+            1
+        );
+        let items = repository::list_calendar(&connection, None, None).unwrap();
+        assert_eq!(items[0].start_at, "2026-08-29T01:00:00Z");
+        let rendered = render_ics(&items);
+        assert!(rendered.lines().all(|line| line.len() <= 75));
+        assert!(rendered.contains("UID:stable-id"));
+        assert_eq!(
+            import_ics_text(&mut connection, &rendered, "test")
+                .unwrap()
+                .updated,
+            1
+        );
+        assert_eq!(
+            repository::list_calendar(&connection, None, None).unwrap()[0].title,
+            title
+        );
+        assert_eq!(unfold_ics("SUMMARY:a\r\n  b")[0], "SUMMARY:a b");
+    }
+
+    #[test]
+    fn bundled_notice_path_is_fixed_and_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let legal = directory.path().join("legal");
+        fs::create_dir(&legal).unwrap();
+        let notices = legal.join("third-party");
+        fs::create_dir(&notices).unwrap();
+        let path = notices.join("NOTICES.txt");
+        fs::write(&path, "third-party terms").unwrap();
+        assert_eq!(
+            legal_notice_path(directory.path()).unwrap(),
+            path.canonicalize().unwrap()
+        );
+        fs::remove_file(&path).unwrap();
+        let other = directory.path().join("other.txt");
+        fs::write(&other, "not a bundled notice").unwrap();
+        symlink(&other, &path).unwrap();
+        assert!(legal_notice_path(directory.path()).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&notices).unwrap();
+        fs::remove_dir(&legal).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::write(external.path().join("NOTICES.txt"), "external").unwrap();
+        symlink(external.path(), &legal).unwrap();
+        assert!(legal_notice_path(directory.path()).is_err());
+    }
     use crate::database::open_database;
 
     #[test]
     fn ics_text_round_trip_and_folded_lines_are_supported() {
         let original = "第一行,带分号;\\\n第二行";
         assert_eq!(unescape_ics(&escape_ics(original)), original);
+        assert_eq!(
+            unescape_ics(&escape_ics("literal \\n and \\N")),
+            "literal \\n and \\N"
+        );
+        assert_eq!(escape_ics("a\rb\r\nc"), "a\\nb\\nc");
         let lines = unfold_ics("SUMMARY:很长的\r\n 标题\r\nUID:test");
         assert_eq!(lines, vec!["SUMMARY:很长的标题", "UID:test"]);
     }
@@ -1123,6 +1229,64 @@ mod tests {
         assert_eq!(saved[0].quantity, "123.4567");
         assert_eq!(saved[0].unit_price, "1.2345");
         assert_eq!(saved[0].fee, "0.12");
+    }
+
+    #[test]
+    fn csv_financial_overflow_skips_rows_without_leaking_assets_or_rounding_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("csv-overflow.sqlite3");
+        let mut connection = open_database(&path, &[83; 32]).unwrap();
+        let account = repository::upsert_account(
+            &connection,
+            InvestmentAccount {
+                id: String::new(),
+                name: "溢出导入测试账户".into(),
+                kind: "securities".into(),
+                currency: "CNY".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+        let csv = concat!(
+            "证券代码,证券名称,资产类型,交易类型,日期,数量,单价,金额,手续费,税费,备注\n",
+            "600001,不应残留的新资产,股票,买入,2026-01-01,79228162514264337593543950335,2,0,0,0,溢出\n",
+            "510300,正常ETF,ETF,买入,2026-01-01,123.4567,1.2345,0,0.12,0,正常精度\n",
+            "510300,不应覆盖原名称,ETF,买入,2026-01-02,1,0.00000000000000000000000000001,0,0,0,不可舍入\n",
+            "510500,后续正常ETF,ETF,买入,2026-01-02,1,4,0,0,0,继续导入\n",
+        );
+        let mut reader = csv::ReaderBuilder::new().from_reader(csv.as_bytes());
+        let headers = reader.headers().unwrap().clone();
+        let records = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+        let report = import_portfolio_records(
+            &mut connection,
+            portfolio_csv_indexes(&headers),
+            &records,
+            &account.id,
+        )
+        .unwrap();
+        assert_eq!(report.imported, 2);
+        assert_eq!(report.skipped, 2);
+        assert!(report.errors[0].contains("第 2 行：交易金额超出可计算范围"));
+        assert!(report.errors[1].contains("第 4 行：单价不是可精确表示的十进制数字"));
+        assert!(connection.is_autocommit());
+        drop(connection);
+        let reopened = open_database(&path, &[83; 32]).unwrap();
+        let assets = repository::list_instruments(&reopened).unwrap();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].name, "正常ETF");
+        assert_eq!(assets[1].name, "后续正常ETF");
+        let trades = repository::list_transactions(&reopened).unwrap();
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[1].quantity, "123.4567");
+        assert_eq!(trades[1].unit_price, "1.2345");
+        assert_eq!(
+            repository::portfolio_snapshot(&reopened)
+                .unwrap()
+                .total_cost,
+            "156.52729615"
+        );
+        repository::dashboard(&reopened, "2026-01-03").unwrap();
     }
 
     #[test]

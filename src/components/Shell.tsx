@@ -65,7 +65,7 @@ export function Shell({ page, setPage, collapsed, setCollapsed, children, onOpen
             <IconButton label="快速记录" onClick={onQuickAdd}><Plus size={19} /></IconButton>
           </div>
         </header>
-        <main className="page-container">{children}</main>
+        <main key={page} className="page-container">{children}</main>
       </div>
     </div>
   );

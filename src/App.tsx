@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
-import { format } from "date-fns";
+import { shanghaiToday } from "./lib/calendar";
 import { DatabaseZap, Fingerprint, Leaf, LockKeyhole, ShieldCheck } from "lucide-react";
-import type { AppSettings, PageKey, SecurityStatus } from "./types";
+import type { AppSettings, PageKey, SecurityStatus, SearchResult } from "./types";
 import { call, WorkbenchError } from "./lib/api";
 import { defaultSettings } from "./lib/defaults";
 import { localDate } from "./lib/format";
@@ -24,6 +24,7 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage").then((module) => 
 function App() {
   const [status, setStatus] = useState<SecurityStatus | null>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
+  const [searchTarget, setSearchTarget] = useState<SearchResult | null>(null);
   const [page, setPage] = useState<PageKey>("today");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
@@ -36,6 +37,7 @@ function App() {
   const [error, setError] = useState<WorkbenchError | null>(null);
   const [lockNotice, setLockNotice] = useState<string | null>(null);
   const quoteChecked = useRef(false);
+  const authenticationGate = useRef(false);
   const securityEpoch = useRef(0);
   const statusRef = useRef<SecurityStatus | null>(null);
 
@@ -46,7 +48,7 @@ function App() {
     setLocalPassword("");
     setLocalPasswordConfirm("");
     setError(null);
-    setPage("today");
+    setSearchTarget(null); setPage("today");
   }, []);
 
   const receiveStatus = useCallback((next: SecurityStatus) => {
@@ -84,11 +86,13 @@ function App() {
   }, []);
 
   async function unlock() {
+    if (authenticationGate.current) return;
     if (status?.keychainMode === "passphrase") {
       setPasswordSetup(false);
       setPasswordOpen(true);
       return;
     }
+    authenticationGate.current = true;
     setUnlocking(true);
     setError(null);
     try {
@@ -104,15 +108,18 @@ function App() {
         setPasswordOpen(true);
       }
     } finally {
+      authenticationGate.current = false;
       setUnlocking(false);
     }
   }
 
   async function unlockWithPassword() {
+    if (authenticationGate.current) return;
     if (passwordSetup && localPassword !== localPasswordConfirm) {
       setError(new WorkbenchError({ code: "PASSWORD_MISMATCH", message: "两次输入的工作台口令不一致" }));
       return;
     }
+    authenticationGate.current = true;
     setUnlocking(true);
     setError(null);
     try {
@@ -126,7 +133,9 @@ function App() {
       await loadSettings();
     } catch (value) {
       setError(value as WorkbenchError);
+      if ((value as WorkbenchError).code === "LOCAL_KEY_ALREADY_EXISTS") setPasswordSetup(false);
     } finally {
+      authenticationGate.current = false;
       setUnlocking(false);
     }
   }
@@ -170,7 +179,7 @@ function App() {
       if (event.key === "Escape") setCommandOpen(false);
     };
     const quickHandler: EventListener = () => {
-      setPage("today");
+      setSearchTarget(null); setPage("today");
       setQuickOpen(true);
     };
     window.addEventListener("keydown", handler);
@@ -183,7 +192,7 @@ function App() {
 
   useEffect(() => {
     if (!status?.unlocked || !settings.quoteEnabled || !settings.quoteAutoRefresh || quoteChecked.current) return;
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = shanghaiToday();
     if (settings.lastQuoteRefresh && localDate(settings.lastQuoteRefresh, "yyyy-MM-dd") === today) {
       quoteChecked.current = true;
       return;
@@ -217,22 +226,22 @@ function App() {
   }
 
   let content;
-  if (page === "today") content = <TodayPage quickOpen={quickOpen} closeQuick={() => setQuickOpen(false)} navigate={setPage} settings={settings} onSettingsChange={setSettings} />;
-  else if (page === "schedule") content = <SchedulePage />;
-  else if (page === "media") content = <MediaPage />;
-  else if (page === "portfolio") content = <PortfolioPage settings={settings} onSettingsChange={setSettings} />;
-  else if (page === "growth") content = <GrowthPage />;
-  else if (page === "work") content = <WorkPage />;
+  if (page === "today") content = <TodayPage quickOpen={quickOpen} closeQuick={() => setQuickOpen(false)} navigate={(next, target) => { setSearchTarget(target ?? null); setPage(next); }} settings={settings} onSettingsChange={setSettings} />;
+  else if (page === "schedule") content = <SchedulePage searchTarget={searchTarget} />;
+  else if (page === "media") content = <MediaPage searchTarget={searchTarget} />;
+  else if (page === "portfolio") content = <PortfolioPage searchTarget={searchTarget} settings={settings} onSettingsChange={setSettings} />;
+  else if (page === "growth") content = <GrowthPage searchTarget={searchTarget} />;
+  else if (page === "work") content = <WorkPage searchTarget={searchTarget} />;
   else if (page === "review") content = <ReviewPage />;
   else content = <SettingsPage settings={settings} onSettingsChange={setSettings} onLock={(notice) => void lock(notice)} />;
 
   return <>
-    <Shell page={page} setPage={setPage} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} onOpenCommand={() => setCommandOpen(true)} onQuickAdd={() => { setPage("today"); setQuickOpen(true); }} onLock={() => void lock()}>
+    <Shell page={page} setPage={(next) => { setSearchTarget(null); setPage(next); }} collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} onOpenCommand={() => setCommandOpen(true)} onQuickAdd={() => { setSearchTarget(null); setPage("today"); setQuickOpen(true); }} onLock={() => void lock()}>
       {status.recoveryNotice && <div className="notice-banner global-warning" role="status"><ShieldCheck size={17} /><span>{status.recoveryNotice}</span><button aria-label="关闭恢复提示" onClick={() => setStatus((current) => current ? { ...current, recoveryNotice: null } : current)}>×</button></div>}
       {status.snapshotWarning && <div className="notice-banner global-warning" role="status"><DatabaseZap size={17} /><span>{status.snapshotWarning}。请检查本机空间和数据目录权限，然后重新打开工作台。</span><button aria-label="关闭提示" onClick={() => setStatus((current) => current ? { ...current, snapshotWarning: null } : current)}>×</button></div>}
       <Suspense fallback={<div className="page"><LoadingBlock rows={6} /></div>}>{content}</Suspense>
     </Shell>
-    <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} navigate={setPage} quickAdd={() => { setPage("today"); setQuickOpen(true); }} />
+    <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} navigate={(destination, result) => { setSearchTarget(result ?? null); setPage(destination); }} quickAdd={() => { setSearchTarget(null); setPage("today"); setQuickOpen(true); }} />
   </>;
 }
 
