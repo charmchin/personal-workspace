@@ -9,6 +9,12 @@
 <p align="center">macOS · Apple Silicon · 本地优先 · 简体中文 · <a href="LICENSE">MIT License</a></p>
 
 <p align="center">
+  <a href="https://github.com/charmchin/personal-workspace/actions/workflows/ci.yml">CI 工作流</a> ·
+  <a href="CONTRIBUTING.md">贡献指南</a> ·
+  <a href="SECURITY.md">安全政策</a>
+</p>
+
+<p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#功能概览">功能概览</a> ·
   <a href="#数据与安全">数据与安全</a> ·
@@ -198,6 +204,8 @@ src-tauri/
 
 ```bash
 npm test
+node --test scripts/check-repository.node-test.mjs
+node scripts/check-repository.mjs
 npm run app:privacy:test
 npm run notices:test
 npm run notices:verify
@@ -219,6 +227,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 cargo test --manifest-path src-tauri/Cargo.toml performance_acceptance -- --ignored --nocapture
 ```
 
+[GitHub Actions CI](.github/workflows/ci.yml) 包含前端／仓库一致性检查，以及 macOS ARM64 Rust、原生通知、构建隐私和第三方许可核对。公开仓库在 `main` 推送与 PR 上自动运行；私有仓库默认跳过，维护者检查额度和费用后可手动勾选允许运行。工作流已配置不等于云端作业通过，跳过也不算测试通过。CI 不启动个人工作台，不使用真实数据，不发布或上传应用包。协作说明见 [贡献指南](CONTRIBUTING.md#ci-与发布边界)。
+
 前期显式执行了 10,000 条任务、5,000 条日志和 50,000 条有效价格记录的性能测试，首页聚合约 17ms、搜索约 0.64ms，满足当时设备上 300ms / 200ms 的目标；不是对所有设备的承诺。独立原生通知冒烟进程验证订阅与撤销。0.1.5 模拟 IPC 布局检查包含 8 个页面、900／1280／1600px、浅／深色及关键嵌套弹窗；结果与本轮性能复测见上述验收文档。这些检查不代替 macOS WebView、Touch ID、真实锁屏／唤醒和最低系统版本验收。
 
 ## 已知限制与改进方向
@@ -229,18 +239,20 @@ cargo test --manifest-path src-tauri/Cargo.toml performance_acceptance -- --igno
 - **投资精度与复盘：** 使用有界精确十进制，不是任意精度引擎；不能精确表示的输入或溢出会被拒绝，除法仍有有限精度边界。收益曲线与周复盘不构成历史组合净值回放、资金加权/时间加权收益或投资建议。
 - **恢复与锁定：** 尚无锁定状态下的独立备份灾难恢复入口；忘记口令没有后门。新源码进程使用同一数据目录的实例锁，但旧安装版不配合该协议，仍不可与新副本同时运行。通知送达不保证零延迟，不能撤回已发出的请求或强行中断已开始的提交。
 - **规模与关联：** 长列表已分批呈现，但部分查询仍全量读取；更大数据集需继续做 SQL 分页和内存验收。任务已有项目／目标／内容关联、日志关联入口，但多任务日志、学习项目关联及周复盘历史投资变化等仍未覆盖完整原始规划。
-- **发行准备：** 已升级本轮确认的 rustls / Vitest 安全修复并更新许可声明；npm 审计当前为零已知漏洞，不代表无未知漏洞或所有 Rust 依赖已全面审计。部分上游维护风险、持续集成、正式版本号、Developer ID 签名、公证及全流程实机验收仍需独立完成。
+- **发行准备：** 已升级本轮确认的 rustls / Vitest 安全修复并更新许可声明；此前本机 npm 审计为零已知漏洞，不代表实时无漏洞或所有 Rust 依赖已全面审计。CI 已配置，云端运行需以 Actions 实际记录为准；部分上游维护风险、稳定版本、Developer ID 签名、公证及全流程实机验收仍需独立完成。
 
 ## 参与贡献
 
 欢迎提交可复现的问题、使用体验和改进建议，也欢迎通过 Pull Request 贡献代码。本项目采用 MIT 许可证，贡献代码前请确认你有权提交该代码，并同意其以本项目的许可证分发。
+
+开始前请阅读 [贡献指南](CONTRIBUTING.md) 和 [社区行为准则](CODE_OF_CONDUCT.md)；仓库提供问题／功能建议表单和 PR 检查清单。私有仓库只有获授权协作者能够访问，MIT 许可本身不会自动将 GitHub 仓库变为公开。
 
 - 提交问题请使用 [GitHub Issues](https://github.com/charmchin/personal-workspace/issues)，包含应用版本、macOS / 芯片、操作步骤、预期与实际结果、错误码。
 - 涉及数据、安全或计算的修改，请附带使用临时数据的回归测试；普通界面修改请提供不含私人数据的截图和窗口尺寸。
 - 保持提交聚焦，运行与变更相关的前端 / Rust 检查；涉及数据库结构时需兼顾已有数据的迁移与恢复。
 - 不要提交数据库、密钥、Token、备份、私人笔记、持仓截图或构建产物。仓库提供忽略规则，但忽略规则不能替代人工核对。
 
-发现潜在安全漏洞时，请不要在公开 Issue 中发布凭据或可利用细节。优先使用仓库已提供的私密报告渠道；如尚未配置，可先提交不包含敏感细节的联系请求。项目尚未承诺固定响应时间。
+发现潜在安全漏洞时，请遵循 [安全政策](SECURITY.md)，不要在公开 Issue 中发布凭据或可利用细节。是否可使用 GitHub 私密报告取决于仓库设置，项目未承诺固定响应时间。
 
 ## 许可证
 

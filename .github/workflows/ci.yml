@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      allow_private_ci:
+        description: '私有仓库：确认已检查 Actions 额度／费用，并允许运行'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend and repository
+    # Public standard runners are free; private runs require explicit dispatch consent.
+    if: ${{ !github.event.repository.private || (github.event_name == 'workflow_dispatch' && inputs.allow_private_ci) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - run: npm ci
+      - name: Repository consistency and regression tests
+        run: |
+          node --test scripts/check-repository.node-test.mjs
+          node scripts/check-repository.mjs
+      - run: npm test
+      - run: npm run notices:test
+      - run: npm run notices:verify
+      - run: npm run build
+
+  macos:
+    name: macOS ARM64 and Rust
+    if: ${{ !github.event.repository.private || (github.event_name == 'workflow_dispatch' && inputs.allow_private_ci) }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - name: Confirm target and prepare toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustc --version
+          xcrun --find clang
+      - run: npm ci
+      # Tauri's compile-time context requires dist; this does not launch the application.
+      - run: npm run build
+      - run: npm run app:privacy:test
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Fetch locked sources for offline licence verification
+        run: cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+      - name: Rust domain, database and native notification tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --release --all-targets --locked -- --test-threads=2
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --release --all-targets --locked -- -D warnings
+      - name: Locked dependency notice correspondence
+        run: npm run notices:check
+
+# No application launch, signing credentials, uploaded artifacts, deployment or real user data.

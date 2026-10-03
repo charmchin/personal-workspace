@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞与敏感问题
+    url: https://github.com/charmchin/personal-workspace/blob/main/SECURITY.md
+    about: 先阅读安全政策；不要通过公开问题反馈披露利用细节或凭据。
+  - name: 安装、数据位置与卸载
+    url: https://github.com/charmchin/personal-workspace/blob/main/README.md#文档
+    about: 操作前请先阅读说明；删除源码不等于删除个人数据。

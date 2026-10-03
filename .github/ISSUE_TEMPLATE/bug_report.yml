@@ -1,0 +1,70 @@
+name: 问题反馈
+description: 使用合成数据描述可复现的功能、布局或计算问题（安全漏洞请遵循 SECURITY.md）
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先搜索已有 Issue。不要上传数据库、备份、密钥、口令、Token、真实持仓或私人截图。
+        潜在安全漏洞不要公开披露利用细节，请先阅读 [安全政策](https://github.com/charmchin/personal-workspace/blob/main/SECURITY.md)。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本／源码提交
+      description: 从设置页查看；源码运行请附提交号。
+      placeholder: '例如：0.1.5，源码提交 abc1234'
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: macOS 版本、芯片、安装版或 tauri dev；不要填写用户名或个人文件路径。
+      placeholder: '例如：macOS 15，M1，源码开发版'
+    validations:
+      required: true
+  - type: dropdown
+    id: module
+    attributes:
+      label: 相关模块
+      options:
+        - 今日
+        - 日程
+        - 自媒体
+        - 投资
+        - 成长
+        - 工作记录
+        - 复盘
+        - 设置／备份／解锁
+        - 构建／其他
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 用虚构记录给出最小复现；布局问题请附窗口尺寸和已脱敏截图。
+      placeholder: |
+        1. 使用测试数据创建……
+        2. 点击……
+        3. 观察……
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期结果与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 错误码／脱敏诊断（可选）
+      description: 请删除个人内容、路径与所有凭据；不要粘贴完整数据库或行情原始响应。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私确认
+      options:
+        - label: 我已检查内容与附件，不包含私人记录、数据库、备份或凭据。
+          required: true
