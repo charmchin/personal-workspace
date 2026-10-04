@@ -2,6 +2,13 @@
 
 本文件记录可识别的源码版本，不代表 GitHub 已发布或使用者已经安装。早期预览仍需保管独立加密备份。
 
+## 发布与文档 — 2026-10-04
+
+- [v0.1.5](https://github.com/charmchin/personal-workspace/releases/tag/v0.1.5) 已发布为源码预览（pre-release），标签固定到提交 `33b0ffcdd6af43da594d984fcffeb96f866e7407`；未提供 `.app` / `.dmg` 安装包。
+- 发布目标的 `Frontend and repository` 与 `macOS ARM64 and Rust` 云端检查均已[通过](https://github.com/charmchin/personal-workspace/actions/runs/37177241738)。主分支保护和私密漏洞报告已独立核验启用，不由文档提交自动设置。
+- README 补充发布入口、源码归档与安装包的区别、固定标签启动及开发分支说明；贡献与安全政策同步已核验状态。
+- 本节文档更新发生在发布标签之后，不修改该标签、应用版本、业务代码、数据或口令。下方记录保留各轮当时的验证状态。
+
 ## 仓库维护 — 2026-10-04
 
 - 新增贡献指南、安全政策、社区行为准则、中文问题／功能建议表单及 PR 模板。
