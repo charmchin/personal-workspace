@@ -15,11 +15,11 @@
 
 **请勿在公开 Issue、PR、截图或聊天中提交密码、裸密钥、Token、数据库或私人备份，也不要公开可利用的漏洞细节。**
 
-1. 如果仓库 Security 页面提供 **Report a vulnerability**，使用 [GitHub 私密漏洞报告入口](https://github.com/charmchin/personal-workspace/security/advisories/new)；仅在功能已启用且页面可用时使用。这不是公开 Issue。
+1. 仓库已启用私密漏洞报告（2026-10-04 核验）。请使用 Security 页面中的 **Report a vulnerability** 或 [GitHub 私密漏洞报告入口](https://github.com/charmchin/personal-workspace/security/advisories/new)。这不是公开 Issue；提交前仍请核对页面确为私密报告。
 2. 若入口不可用，请先通过功能建议模板仅提交“请求私密安全联络”的联系请求，不附复现细节、载荷、私人数据或凭据；等待维护者确定私密渠道再补充材料。请勿向提交记录的 noreply 地址发送报告。
 3. 仓库为私有状态时，获授权协作者先通过现有受限协作渠道联系维护者；不要假设仓库将永远保持私有。
 
-项目目前不提供独立安全邮箱或固定 SLA。单独添加此文件不代表已启用 GitHub 私密报告；该功能及公开后的访问策略需要维护者在仓库设置中确认。参见 [GitHub 官方说明](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately)。
+项目目前不提供独立安全邮箱或固定 SLA。私密报告依赖 GitHub 仓库设置，不由本地应用提供；上述核验不保证该入口永远可用，失效时请使用后备联系方法。参见 [GitHub 官方说明](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately)。
 
 通过已确认的私密渠道报告时，请提供版本／提交、macOS 与芯片、风险影响、前提条件和使用虚构数据的最小复现。如有修复建议可同时提供。不要为了证明漏洞而读取他人数据或对真实库做破坏性测试。
 

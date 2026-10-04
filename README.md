@@ -9,6 +9,7 @@
 <p align="center">macOS · Apple Silicon · 本地优先 · 简体中文 · <a href="LICENSE">MIT License</a></p>
 
 <p align="center">
+  <a href="https://github.com/charmchin/personal-workspace/releases/tag/v0.1.5">v0.1.5 源码预览</a> ·
   <a href="https://github.com/charmchin/personal-workspace/actions/workflows/ci.yml">CI 工作流</a> ·
   <a href="CONTRIBUTING.md">贡献指南</a> ·
   <a href="SECURITY.md">安全政策</a>
@@ -26,6 +27,12 @@
 无需注册账号；业务功能默认离线运行；没有云同步、遥测或广告。可选行情由用户主动启用，不是使用其他模块的前提。
 
 > 当前源码版本为 **0.1.5，早期预览**。本版本修复今日任务交互与统计，并补齐工作日志、自媒体、成长目标的行动关联，见[更新日志](CHANGELOG.md)。请先用非关键数据体验，定期导出加密备份；详见[已知限制](#已知限制与改进方向)。源码版本不表示每台设备已安装该版本。
+
+## 获取发布版本
+
+[v0.1.5 预发布](https://github.com/charmchin/personal-workspace/releases/tag/v0.1.5) 已公开，发布说明包含功能、升级注意、验证证据及已知边界。该版本**仅提供源码，不提供安装包**；Release 页面自动生成的 `Source code (zip)` / `Source code (tar.gz)` 不是可直接安装的 `.app` 或 `.dmg`。
+
+首次体验请按下方步骤获取固定的 `v0.1.5` 标签并在本机构建。`main` 是持续开发分支，后续文档或代码可能与该发布版本不同；发布标签不随 `main` 更新，也不自动升级本机应用。当前尚无 Apple Developer ID 签名、公证或稳定版承诺。
 
 ## 为什么做这个工作台
 
@@ -72,12 +79,16 @@
 
 ### 2. 获取源码并启动
 
+获取与发布说明一致的固定版本：
+
 ```bash
-git clone https://github.com/charmchin/personal-workspace.git
+git clone --branch v0.1.5 --depth 1 https://github.com/charmchin/personal-workspace.git
 cd personal-workspace
 npm ci
 npm run tauri dev
 ```
+
+该方式检出发布标签，Git 提示 `detached HEAD` 是正常现象，不妨碍构建。若要贡献代码或获取未发布改动，请改为克隆 `main`，再按[贡献指南](CONTRIBUTING.md#环境与分支)创建工作分支；不要在未保存改动的目录中直接切换版本。
 
 首次构建需要下载 npm / Cargo 依赖，并编译 Rust、SQLCipher 与其加密依赖，耗时取决于网络和设备。**业务离线运行不等于首次安装依赖也无需联网。**
 
@@ -227,7 +238,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 cargo test --manifest-path src-tauri/Cargo.toml performance_acceptance -- --ignored --nocapture
 ```
 
-[GitHub Actions CI](.github/workflows/ci.yml) 包含前端／仓库一致性检查，以及 macOS ARM64 Rust、原生通知、构建隐私和第三方许可核对。公开仓库在 `main` 推送与 PR 上自动运行；私有仓库默认跳过，维护者检查额度和费用后可手动勾选允许运行。工作流已配置不等于云端作业通过，跳过也不算测试通过。CI 不启动个人工作台，不使用真实数据，不发布或上传应用包。协作说明见 [贡献指南](CONTRIBUTING.md#ci-与发布边界)。
+[GitHub Actions CI](.github/workflows/ci.yml) 包含前端／仓库一致性检查，以及 macOS ARM64 Rust、原生通知、构建隐私和第三方许可核对。`v0.1.5` 对应提交 `33b0ffcdd6af43da594d984fcffeb96f866e7407` 的两项云端检查均已[实际通过](https://github.com/charmchin/personal-workspace/actions/runs/37177241738)，该结果只对应此提交，不保证后续提交通过。公开仓库在 `main` 推送与 PR 上自动运行；私有仓库默认跳过，维护者检查额度和费用后可手动勾选允许运行。跳过不算测试通过。CI 不启动个人工作台，不使用真实数据，不发布或上传应用包。协作说明见 [贡献指南](CONTRIBUTING.md#ci-与发布边界)。
 
 前期显式执行了 10,000 条任务、5,000 条日志和 50,000 条有效价格记录的性能测试，首页聚合约 17ms、搜索约 0.64ms，满足当时设备上 300ms / 200ms 的目标；不是对所有设备的承诺。独立原生通知冒烟进程验证订阅与撤销。0.1.5 模拟 IPC 布局检查包含 8 个页面、900／1280／1600px、浅／深色及关键嵌套弹窗；结果与本轮性能复测见上述验收文档。这些检查不代替 macOS WebView、Touch ID、真实锁屏／唤醒和最低系统版本验收。
 
@@ -252,7 +263,7 @@ cargo test --manifest-path src-tauri/Cargo.toml performance_acceptance -- --igno
 - 保持提交聚焦，运行与变更相关的前端 / Rust 检查；涉及数据库结构时需兼顾已有数据的迁移与恢复。
 - 不要提交数据库、密钥、Token、备份、私人笔记、持仓截图或构建产物。仓库提供忽略规则，但忽略规则不能替代人工核对。
 
-发现潜在安全漏洞时，请遵循 [安全政策](SECURITY.md)，不要在公开 Issue 中发布凭据或可利用细节。是否可使用 GitHub 私密报告取决于仓库设置，项目未承诺固定响应时间。
+发现潜在安全漏洞时，请遵循 [安全政策](SECURITY.md)，使用已启用的 [GitHub 私密漏洞报告入口](https://github.com/charmchin/personal-workspace/security/advisories/new)，不要在公开 Issue 中发布凭据或可利用细节。若入口不可用，按安全政策的后备方式联系；项目未承诺固定响应时间。
 
 ## 许可证
 

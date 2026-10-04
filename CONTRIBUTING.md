@@ -63,6 +63,8 @@ CI 使用只读权限、固定完整提交 SHA 的官方 Actions，不使用 `pu
 
 发布版 `.app` 构建仍使用 `npm run app:build`。签名、公证、真实设备验收及版本 Release 是独立步骤，CI 不代替它们。请勿把运行缓存、数据库、密钥、备份、私人截图或未公证产物加入仓库。
 
-维护者公开发行前还应在 GitHub 设置中确认仓库可见性、Issues、Actions 权限和私密漏洞报告入口；文件不能代替这些设置。首次云端 CI 真实通过后，再把 `Frontend and repository` 与 `macOS ARM64 and Rust` 配置为主分支所需检查，并按协作人数选择审批要求，避免单维护者无法审批自己的 PR。不要把当前跳过的作业设成“测试已通过”的依据。
+当前仓库已公开，`main` 已启用分支保护，所需检查为 `Frontend and repository` 与 `macOS ARM64 and Rust`；私密漏洞报告已启用（2026-10-04 核验）。后续修改通过工作分支／PR 提交，等待对应提交的所需检查通过后再合并，不直接推送或强推 `main`。文件不能代替这些外部设置；维护者仍须定期确认权限，并按协作人数选择审批要求，避免单维护者无法审批自己的 PR。
 
-工作流 runner 标签与私有仓库费用边界参考 [GitHub runner 官方说明](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)；只读权限与完整提交 SHA 锁定遵循 [官方安全建议](https://docs.github.com/en/actions/reference/security/secure-use)。这些外部设置、费用核对、公开操作和分支规则未由本次源码提交自动执行。
+`v0.1.5` 已作为[源码预发布](https://github.com/charmchin/personal-workspace/releases/tag/v0.1.5)发布，固定到提交 `33b0ffcdd6af43da594d984fcffeb96f866e7407`；两项云端检查的[通过记录](https://github.com/charmchin/personal-workspace/actions/runs/37177241738)对应该提交。发布说明与升级边界须对应实际标签，不移动已公开的版本标签，也不将后续 `main` 的结果追记为该标签已包含的功能。修复发布使用新版本；只有源码可用时明确标为 pre-release，不上传未经发行验收的安装包。
+
+工作流 runner 标签与私有仓库费用边界参考 [GitHub runner 官方说明](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)；只读权限与完整提交 SHA 锁定遵循 [官方安全建议](https://docs.github.com/en/actions/reference/security/secure-use)。外部设置与费用需独立核对，修改这些文档不会自动改变它们。
